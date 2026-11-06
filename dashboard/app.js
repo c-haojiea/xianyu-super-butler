@@ -210,6 +210,9 @@ function renderCalendar(data) {
       date: d.date,
       revenue: d.revenue,
       orders: d.orders,
+      cancelled: d.cancelled_orders || 0,
+      refunds: d.refund_orders || 0,
+      refundValue: d.refund_value || 0,
     };
     // 深色格子里换成浅色字，保证数字始终看得清
     if (d.revenue >= max * 0.5) {
@@ -217,6 +220,26 @@ function renderCalendar(data) {
     }
     return item;
   });
+  // 有退款或有取消的日期，在格子顶部加一个小圆点
+  const flags = days
+    .filter((d) => (d.cancelled_orders || 0) + (d.refund_orders || 0) > 0)
+    .map((d) => {
+      const dt = new Date(d.date + "T00:00:00");
+      return {
+        value: [weekIndexOf(dt), weekdayOf(dt)],
+        kind: "flag",
+        date: d.date,
+        cancelled: d.cancelled_orders || 0,
+        refunds: d.refund_orders || 0,
+        refundValue: d.refund_value || 0,
+      };
+    });
+  const flagText = (d) => {
+    const parts = [];
+    if (d.refunds) parts.push(`退款 ${d.refunds} 笔${d.refundValue ? " " + fmtMoney(d.refundValue) : ""}`);
+    if (d.cancelled) parts.push(`取消 ${d.cancelled} 单`);
+    return parts.join(" · ");
+  };
   const weekCount = weekIndexOf(new Date(days[days.length - 1].date + "T00:00:00")) + 1;
   const weekLabels = new Array(weekCount).fill("");
   for (let i = 0; i < weekCount; i++) {
@@ -242,9 +265,14 @@ function renderCalendar(data) {
       trigger: "item",
       formatter: (p) => {
         if (!p.data) return "";
+        if (p.data.kind === "flag") {
+          return `<div style="font-family:${MONO};font-size:11px;color:${COLORS.muted}">${p.data.date}</div>
+          <div style="margin-top:2px;color:${COLORS.accent}"><b>${flagText(p.data)}</b></div>`;
+        }
         return `<div style="font-family:${MONO};font-size:11px;color:${COLORS.muted}">${p.data.date}</div>
           <div style="margin-top:2px"><b>${p.data.orders ? fmtMoney(p.data.revenue) : "无成交"}</b>
-          ${p.data.orders ? ` · ${p.data.orders} 单` : ""}</div>`;
+          ${p.data.orders ? ` · ${p.data.orders} 单` : ""}</div>
+          ${flagText(p.data) ? `<div style="margin-top:2px;font-size:10.5px;color:${COLORS.accent}">${flagText(p.data)}</div>` : ""}`;
       },
     }),
     xAxis: {
@@ -307,6 +335,16 @@ function renderCalendar(data) {
         },
       },
       emphasis: { itemStyle: { borderColor: COLORS.ink, borderWidth: 1 } },
+    }, {
+      // 退款/取消角标：叠加在同一套坐标上的小圆点，往格子顶部偏 8px
+      type: "scatter",
+      data: flags,
+      symbol: "circle",
+      symbolSize: 5,
+      symbolOffset: [0, -8],
+      itemStyle: { color: COLORS.accent, borderColor: COLORS.paper2, borderWidth: 1 },
+      emphasis: { scale: 1.6, itemStyle: { color: COLORS.ink, borderColor: COLORS.accent } },
+      z: 10,
     }],
   }, true);
 
@@ -483,6 +521,90 @@ function renderProductTable() {
   });
 }
 
+function renderCategories(data) {
+  const cats = data.categories || [];
+  const el = $("#catBars");
+  if (!el) return;
+  const total = cats.reduce((s, c) => s + c.orders, 0) || 1;
+  const colors = [COLORS.accent, COLORS.jade, COLORS.gold, "rgba(23,19,15,0.35)"];
+  el.innerHTML = `
+    <div class="block-title"><span>品类结构 · 按订单量</span><span class="block-count">共 ${fmtInt(total)} 单</span></div>
+    ${cats.map((c, i) => {
+      const pct = (c.orders / total) * 100;
+      return `<div class="cat-row">
+        <span class="cat-name">${escapeHtml(c.name)}</span>
+        <span class="cat-track"><i style="width:${pct.toFixed(1)}%;background:${colors[i % colors.length]}"></i></span>
+        <span class="cat-val">${c.orders} 单 · ${pct.toFixed(1)}% · ${fmtMoney(c.revenue)}</span>
+      </div>`;
+    }).join("")}`;
+}
+
+function renderQuality(data) {
+  const r = data.refunds || {};
+  const w = data.weekly || {};
+
+  const cls = (p) => (p == null ? "qc-flat" : p >= 0 ? "qc-up" : "qc-down");
+  const txt = (p) => (p == null ? "上周无数据" : `${p >= 0 ? "▲" : "▼"} ${Math.abs(p).toFixed(1)}%`);
+
+  $("#weekCompare").innerHTML = `
+    <div class="week-card this">
+      <div class="wc-label">本周 · ${escapeHtml(w.this ? w.this.label : "")}</div>
+      <div class="wc-value">${fmtMoney(w.this ? w.this.revenue : 0)}<small>${fmtInt(w.this ? w.this.orders : 0)} 单</small></div>
+    </div>
+    <div class="wc-vs">
+      <div class="wc-delta ${cls(w.revenue_delta_pct)}">成交额 ${txt(w.revenue_delta_pct)}</div>
+      <div class="wc-delta ${cls(w.orders_delta_pct)}">订单 ${txt(w.orders_delta_pct)}</div>
+    </div>
+    <div class="week-card last">
+      <div class="wc-label">上周同期 · ${escapeHtml(w.last ? w.last.label : "")}</div>
+      <div class="wc-value">${fmtMoney(w.last ? w.last.revenue : 0)}<small>${fmtInt(w.last ? w.last.orders : 0)} 单</small></div>
+    </div>`;
+
+  const cells = [
+    {
+      label: "CANCEL RATE / 取消率",
+      value: fmtPct(r.cancel_rate),
+      foot: `全量 ${fmtInt(r.total_orders)} 单中的占比`,
+      cls: "q-warn",
+    },
+    {
+      label: "CANCELLED / 取消",
+      value: `${fmtInt(r.cancelled_orders)} 单`,
+      foot: `取消金额 ${fmtMoney(r.cancelled_value)}`,
+      cls: "q-warn",
+    },
+    {
+      label: "REFUND / 退款",
+      value: `${fmtInt(r.refund_orders)} 单`,
+      foot: `退款 ${fmtMoney(r.refund_value)} · 其中有效单 ${r.refund_in_valid_orders} 笔 ${fmtMoney(r.refund_in_valid_value)}`,
+    },
+    {
+      label: "NET / 净收入",
+      value: fmtMoney(r.net_revenue),
+      foot: `成交额 ${fmtMoney(data.summary.total_revenue)} − 有效单退款 ${fmtMoney(r.refund_in_valid_value)}`,
+      cls: "q-good",
+    },
+  ];
+  $("#qualityGrid").innerHTML = cells.map((c) => `
+    <div class="q-metric ${c.cls || ""}">
+      <div class="l">${escapeHtml(c.label)}</div>
+      <div class="v">${c.value}</div>
+      <div class="f">${c.foot}</div>
+    </div>`).join("");
+
+  const top = r.top_cancelled || [];
+  $("#cancelCount").textContent = `${top.length} 个`;
+  $("#cancelList").innerHTML = top.map((c, i) => `
+    <div class="cancel-item">
+      <span class="cancel-rank">0${i + 1}</span>
+      <h3 class="cancel-title" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</h3>
+      <span class="cancel-count">${c.cancelled} 单</span>
+      <span class="cancel-reason">取消 ${c.cancelled} 单，其中退款 ${c.refund_orders} 单${c.refund_orders ? " " + fmtMoney(c.refund_value) : ""}</span>
+    </div>`).join("") || `<div class="kpi-foot">本期没有取消订单</div>`;
+
+  $("#qualityMeta").textContent = `取消率 ${fmtPct(r.cancel_rate)} · 净收入 ${fmtMoney(r.net_revenue)}`;
+}
+
 function renderInsights(data) {
   const hot = data.insights.hot || [];
   const cold = data.insights.cold || [];
@@ -646,6 +768,42 @@ function drawerReasons(p) {
   return reasons;
 }
 
+function dailyLineSvg(p) {
+  const daily = (p && p.daily) || [];
+  if (!daily.length) return "";
+  // 抽屉隐藏时 ECharts 宽高为 0，这里手写内联 SVG，不依赖容器尺寸
+  const w = 320, h = 64, padX = 4, top = 18, bottom = 50;
+  const max = Math.max(...daily.map((d) => d.orders), 1);
+  const step = (w - padX * 2) / Math.max(daily.length - 1, 1);
+  const pts = daily.map((d, i) => [
+    padX + i * step,
+    d.orders ? bottom - (d.orders / max) * (bottom - top) : bottom,
+  ]);
+  const line = pts.map((v, i) => `${i ? "L" : "M"}${v[0].toFixed(1)},${v[1].toFixed(1)}`).join(" ");
+  const area = `M${pts[0][0].toFixed(1)},${bottom} ` +
+    pts.map((v) => `L${v[0].toFixed(1)},${v[1].toFixed(1)}`).join(" ") +
+    ` L${pts[pts.length - 1][0].toFixed(1)},${bottom} Z`;
+  let peakIdx = 0;
+  daily.forEach((d, i) => { if (d.orders > daily[peakIdx].orders) peakIdx = i; });
+  const peak = daily[peakIdx];
+  const peakPt = pts[peakIdx];
+  const labelX = Math.min(Math.max(peakPt[0], 56), w - 56);
+  const labelY = Math.max(peakPt[1] - 7, 11);
+  const ordersSum = daily.reduce((s, d) => s + d.orders, 0);
+  const revenueSum = daily.reduce((s, d) => s + d.revenue, 0);
+
+  return `<div class="drawer-line-meta">近 30 天 ${ordersSum} 单 · ${fmtMoney(revenueSum)}</div>
+    <svg class="drawer-line" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="最近 30 天日销">
+      <line x1="${padX}" y1="${bottom}" x2="${w - padX}" y2="${bottom}" stroke="${COLORS.line}" stroke-width="1"/>
+      <path d="${area}" fill="rgba(196, 70, 43, 0.12)"/>
+      <path d="${line}" fill="none" stroke="${COLORS.accent}" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>
+      ${peak.orders ? `<circle cx="${peakPt[0].toFixed(1)}" cy="${peakPt[1].toFixed(1)}" r="3" fill="${COLORS.accent}" stroke="${COLORS.paper2}" stroke-width="1"/>` : ""}
+      ${peak.orders ? `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-size="9" font-family="${MONO}" fill="${COLORS.accent}">峰值 ${peak.orders} 单 · ${peak.date.slice(5)}</text>` : ""}
+      <text x="${padX}" y="${h - 3}" font-size="8" font-family="${MONO}" fill="${COLORS.muted}">${daily[0].date.slice(5)}</text>
+      <text x="${w - padX}" y="${h - 3}" text-anchor="end" font-size="8" font-family="${MONO}" fill="${COLORS.muted}">今天</text>
+    </svg>`;
+}
+
 function renderDrawerContent(p) {
   const orders = state.data.orders.filter((o) => o.item_id === p.id).slice(0, 8);
   const metrics = [
@@ -663,6 +821,8 @@ function renderDrawerContent(p) {
     </div>
     <div class="drawer-section-title">诊断结论</div>
     <ul class="drawer-reasons">${drawerReasons(p).map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+    <div class="drawer-section-title">最近 30 天日销</div>
+    ${dailyLineSvg(p)}
     <div class="drawer-section-title">最近订单</div>
     <div class="drawer-orders">
       ${orders.length ? orders.map((o) => `<div class="drawer-order">
@@ -678,7 +838,9 @@ function renderAll(data) {
   renderKpis(data);
   renderCalendar(data);
   renderProducts(data);
+  renderCategories(data);
   renderInsights(data);
+  renderQuality(data);
   renderTime(data);
   renderRecent(data);
   if (state.selectedDate) showDay(state.selectedDate);
@@ -781,4 +943,4 @@ bind();
 loadData();
 
 // 供自动化测试与调试使用
-window.__dashboard = { state, showDay, openProduct, closeDrawer, loadData };
+window.__dashboard = { state, showDay, openProduct, closeDrawer, loadData, dailyLineSvg };

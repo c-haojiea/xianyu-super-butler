@@ -63,7 +63,7 @@
       <div class="cal-months" id="calMonths"></div>
       <div class="chart chart-calendar" id="calendarChart"></div>
       <div class="calendar-foot">
-        <span class="cal-hint">颜色越深 = 当日成交额越高 · 点击任意格子查看当天订单</span>
+        <span class="cal-hint">颜色越深 = 当日成交额越高 · 红点 = 当天有退款或取消 · 点击任意格子查看当天订单</span>
         <span class="cal-legend"><span>低</span><i></i><span>高</span><b id="calMax"></b></span>
       </div>
       <div class="day-detail" id="dayDetail" hidden></div>
@@ -97,6 +97,7 @@
             </table>
           </div>
         </div>
+        <div class="cat-bars" id="catBars"></div>
     </section>
 
     <section class="panel insights-panel reveal" style="--i:3">
@@ -123,10 +124,27 @@
         </div>
     </section>
 
-    <div class="grid-two lower">
-      <section class="panel time-panel reveal" style="--i:4">
+    <section class="panel quality-panel reveal" style="--i:4">
         <div class="panel-head">
           <div class="head-index">04</div>
+          <div class="head-copy">
+            <h2>经营质量 · 退款与取消</h2>
+            <p>本周对比上周同一时刻、取消与退款规模、扣掉退款后的净收入，以及最容易被取消的商品。</p>
+          </div>
+          <div class="panel-meta" id="qualityMeta"></div>
+        </div>
+        <div class="week-compare" id="weekCompare"></div>
+        <div class="quality-grid" id="qualityGrid"></div>
+        <div class="cancel-block">
+          <div class="block-title"><span>取消最多的商品</span><span class="block-count" id="cancelCount">--</span></div>
+          <div class="cancel-list" id="cancelList"></div>
+        </div>
+    </section>
+
+    <div class="grid-two lower">
+      <section class="panel time-panel reveal" style="--i:5">
+        <div class="panel-head">
+          <div class="head-index">05</div>
           <div class="head-copy">
             <h2>售卖时段 · 什么时候有人下单</h2>
             <p>横轴为小时，纵轴为星期。颜色越深，订单越集中。</p>
@@ -138,9 +156,9 @@
         <div class="time-notes" id="timeNotes"></div>
       </section>
 
-      <section class="panel recent-panel reveal" style="--i:5">
+      <section class="panel recent-panel reveal" style="--i:6">
         <div class="panel-head">
-          <div class="head-index">05</div>
+          <div class="head-index">06</div>
           <div class="head-copy">
             <h2>最近成交</h2>
             <p>最近 12 笔订单，按成交时间倒序。</p>
@@ -154,6 +172,10 @@
 
   <footer class="footer">
     <span>XIANYU STORE LEDGER / 数据源：本地 SQLite 订单库</span>
+    <div class="csv-links">
+      <a class="csv-link" href="/api/export/orders.csv" download>订单明细 CSV</a>
+      <a class="csv-link" href="/api/export/products.csv" download>商品汇总 CSV</a>
+    </div>
     <span id="footerNote">—</span>
   </footer>
 

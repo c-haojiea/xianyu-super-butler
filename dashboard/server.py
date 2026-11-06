@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 import socket
@@ -125,6 +127,63 @@ def load_data():
         today_buyers = len({o["buyer_id"] for o in today_orders if o["buyer_id"]})
         total_buyers = len({o["buyer_id"] for o in valid if o["buyer_id"]})
 
+        # 取消 / 退款（全量订单口径：cancelled 也算在分母里）
+        cancelled = [o for o in orders if o["status"] == "cancelled"]
+        cancelled_value = round(sum(o["amount"] for o in cancelled), 2)
+        cancel_rate = round(len(cancelled) / len(orders) * 100, 1) if orders else 0
+        refund_orders_all = [o for o in orders if o["refund"] > 0]
+        refund_value = round(sum(o["refund"] for o in refund_orders_all), 2)
+        refund_valid = [o for o in refund_orders_all if o["status"] in VALID_STATUS and o["amount"] > 0]
+        refund_valid_value = round(sum(o["refund"] for o in refund_valid), 2)
+        net_revenue = round(rev(valid) - refund_valid_value, 2)
+
+        quality = {}
+        for o in orders:
+            if o["status"] != "cancelled" and o["refund"] <= 0:
+                continue
+            row = quality.setdefault(o["item_id"], {
+                "id": o["item_id"], "cancelled": 0, "refund_orders": 0, "refund_value": 0.0,
+            })
+            if o["status"] == "cancelled":
+                row["cancelled"] += 1
+            if o["refund"] > 0:
+                row["refund_orders"] += 1
+                row["refund_value"] += o["refund"]
+        by_product = []
+        for item_id, row in quality.items():
+            item = items.get(item_id)
+            row["title"] = item["title"] if item else "未识别商品"
+            row["refund_value"] = round(row["refund_value"], 2)
+            by_product.append(row)
+        by_product.sort(key=lambda r: (-r["cancelled"], -r["refund_orders"], r["id"]))
+        top_cancelled = by_product[:3]
+
+        # 本周 vs 上周同期（同一时刻截止，避免「整周 vs 半天」的比较偏差）
+        week_start = today_start - timedelta(days=today_start.weekday())
+        last_week_start = week_start - timedelta(days=7)
+        last_week_cutoff = now - timedelta(days=7)
+        this_week_orders = [o for o in valid if o["dt"] >= week_start]
+        last_week_orders = [o for o in valid if last_week_start <= o["dt"] < last_week_cutoff]
+
+        def delta_pct(cur, prev):
+            return round((cur - prev) / prev * 100, 1) if prev else None
+
+        weekly = {
+            "week_start": week_start.strftime("%Y-%m-%d"),
+            "this": {
+                "label": f"{week_start.strftime('%m-%d')} 至今",
+                "orders": len(this_week_orders),
+                "revenue": rev(this_week_orders),
+            },
+            "last": {
+                "label": f"{last_week_start.strftime('%m-%d')} ~ {last_week_cutoff.strftime('%m-%d %H:%M')}",
+                "orders": len(last_week_orders),
+                "revenue": rev(last_week_orders),
+            },
+            "revenue_delta_pct": delta_pct(rev(this_week_orders), rev(last_week_orders)),
+            "orders_delta_pct": delta_pct(len(this_week_orders), len(last_week_orders)),
+        }
+
         # 商品聚合
         stats = {}
         for o in valid:
@@ -198,6 +257,25 @@ def load_data():
             else:
                 p["first_days"] = None
 
+        # 单品最近 30 天（含今天）日销，用于抽屉折线
+        daily_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(29, -1, -1)]
+        daily_map = defaultdict(dict)
+        for o in last30_orders:
+            key = o["dt"].strftime("%Y-%m-%d")
+            e = daily_map[o["item_id"]].setdefault(key, {"orders": 0, "revenue": 0.0})
+            e["orders"] += 1
+            e["revenue"] += o["amount"]
+        for p in products:
+            dm = daily_map.get(p["id"], {})
+            p["daily"] = [
+                {
+                    "date": d,
+                    "orders": dm[d]["orders"] if d in dm else 0,
+                    "revenue": round(dm[d]["revenue"], 2) if d in dm else 0,
+                }
+                for d in daily_dates
+            ]
+
         top = sorted(products, key=lambda p: (p["orders"], p["revenue"]), reverse=True)[:10]
         cold_candidates = [p for p in products if p["orders"] <= 1]
         cold = sorted(cold_candidates, key=lambda p: (p["orders"], -(p["listing_age_days"] or 0)))[:6]
@@ -209,14 +287,27 @@ def load_data():
             key = o["dt"].strftime("%Y-%m-%d")
             day_map[key]["revenue"] += o["amount"]
             day_map[key]["orders"] += 1
+        cancel_map = defaultdict(int)
+        refund_map = defaultdict(lambda: {"orders": 0, "value": 0.0})
+        for o in orders:
+            key = o["dt"].strftime("%Y-%m-%d")
+            if o["status"] == "cancelled":
+                cancel_map[key] += 1
+            if o["refund"] > 0:
+                refund_map[key]["orders"] += 1
+                refund_map[key]["value"] += o["refund"]
         cursor = cal_start
         while cursor.date() <= today:
             key = cursor.strftime("%Y-%m-%d")
             entry = day_map.get(key)
+            refunds = refund_map.get(key)
             calendar.append({
                 "date": key,
                 "revenue": round(entry["revenue"], 2) if entry else 0.0,
                 "orders": entry["orders"] if entry else 0,
+                "cancelled_orders": cancel_map.get(key, 0),
+                "refund_orders": refunds["orders"] if refunds else 0,
+                "refund_value": round(refunds["value"], 2) if refunds else 0.0,
             })
             cursor += timedelta(days=1)
 
@@ -273,6 +364,8 @@ def load_data():
             "pending_count": len(pending),
             "pending_value": rev(pending),
             "total_revenue": rev(valid),
+            "net_revenue": net_revenue,
+            "cancel_rate": cancel_rate,
             "total_orders": len(valid),
             "total_buyers": total_buyers,
             "repeat_rate": round((1 - total_buyers / len(valid)) * 100, 1) if valid else 0,
@@ -410,6 +503,20 @@ def load_data():
                 "period": period,
             },
             "products": {"top": top, "all": products, "cold": cold},
+            "refunds": {
+                "total_orders": len(orders),
+                "cancelled_orders": len(cancelled),
+                "cancelled_value": cancelled_value,
+                "cancel_rate": cancel_rate,
+                "refund_orders": len(refund_orders_all),
+                "refund_value": refund_value,
+                "refund_in_valid_orders": len(refund_valid),
+                "refund_in_valid_value": refund_valid_value,
+                "net_revenue": net_revenue,
+                "by_product": by_product,
+                "top_cancelled": top_cancelled,
+            },
+            "weekly": weekly,
             "insights": {"hot": hot_cards, "cold": cold_cards, "time": time_insights, "overall": overall},
             "categories": categories,
             "orders": order_rows,
@@ -417,6 +524,74 @@ def load_data():
         }
     finally:
         con.close()
+
+
+def _csv_payload(header, rows):
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    # Excel 需要 BOM 才能按 UTF-8 正确识别中文
+    return ("\ufeff" + buf.getvalue()).encode("utf-8")
+
+
+def export_orders_csv():
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        titles = {
+            str(r["item_id"]): (r["item_title"] or "")
+            for r in con.execute("select item_id,item_title from item_info")
+        }
+        rows = []
+        for r in con.execute(
+            "select order_id,item_id,buyer_id,amount,refund_fee,order_status,created_at "
+            "from orders order by created_at desc"
+        ):
+            created = r["created_at"] or ""
+            status = r["order_status"] or ""
+            rows.append([
+                created[:10],
+                created[11:16],
+                str(r["order_id"] or ""),
+                str(r["item_id"] or ""),
+                titles.get(str(r["item_id"] or ""), "未识别商品"),
+                f"{money(r['amount']):.2f}",
+                f"{money(r['refund_fee']):.2f}",
+                STATUS_LABEL.get(status, status),
+                str(r["buyer_id"] or ""),
+            ])
+        return _csv_payload(
+            ["日期", "时间", "订单号", "商品ID", "商品标题", "金额", "退款金额", "状态", "买家ID"],
+            rows,
+        )
+    finally:
+        con.close()
+
+
+def export_products_csv():
+    data = load_data()
+    quality = {row["id"]: row for row in data["refunds"]["by_product"]}
+    rows = []
+    for p in sorted(data["products"]["all"], key=lambda x: (-x["orders"], -x["revenue"])):
+        q = quality.get(p["id"])
+        rows.append([
+            p["id"],
+            p["title"],
+            p["category"],
+            p["orders"],
+            f"{p['revenue']:.2f}",
+            q["refund_orders"] if q else 0,
+            f"{(q['refund_value'] if q else 0):.2f}",
+            q["cancelled"] if q else 0,
+            p["buyers"],
+            p["active_days"],
+            "" if p["listing_age_days"] is None else p["listing_age_days"],
+        ])
+    return _csv_payload(
+        ["商品ID", "标题", "品类", "订单数", "成交额", "退款单数", "退款额", "取消单数", "买家数", "活跃天", "上架天数"],
+        rows,
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -441,10 +616,25 @@ class Handler(BaseHTTPRequestHandler):
             data = f.read()
         self._send(200, data, ctype, cache)
 
+    def _csv(self, data, filename):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
             self._send(200, json.dumps({"ok": True, "ts": datetime.now().isoformat()}, ensure_ascii=False))
+            return
+        if path == "/api/export/orders.csv":
+            self._csv(export_orders_csv(), "orders.csv")
+            return
+        if path == "/api/export/products.csv":
+            self._csv(export_products_csv(), "products.csv")
             return
         if path == "/api/dashboard":
             try:
