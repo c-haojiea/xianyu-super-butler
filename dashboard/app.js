@@ -26,7 +26,12 @@ const state = {
   selectedDate: null,
   drawerProduct: null,
   charts: {},
+  refreshMs: 600000,
+  refreshTimer: null,
 };
+
+const REFRESH_KEY = "xy_dashboard_refresh_ms";
+const REFRESH_LABELS = { "0": "手动刷新", "60000": "每分钟自动刷新", "600000": "每 10 分钟自动刷新", "3600000": "每小时自动刷新" };
 
 const fmtMoney = (v) =>
   "¥" + Number(v || 0).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -197,14 +202,20 @@ function renderCalendar(data) {
   const dayMs = 86400000;
   const weekIndexOf = (dt) => Math.floor((dt - weekStart) / (7 * dayMs));
   const weekdayOf = (dt) => (dt.getDay() + 6) % 7;
+  const max = data.calendar.max || 1;
   const values = days.map((d) => {
     const dt = new Date(d.date + "T00:00:00");
-    return {
+    const item = {
       value: [weekIndexOf(dt), weekdayOf(dt), d.revenue],
       date: d.date,
       revenue: d.revenue,
       orders: d.orders,
     };
+    // 深色格子里换成浅色字，保证数字始终看得清
+    if (d.revenue >= max * 0.5) {
+      item.label = { color: "#fbf6ec", textBorderColor: "rgba(23, 19, 15, 0.55)" };
+    }
+    return item;
   });
   const weekCount = weekIndexOf(new Date(days[days.length - 1].date + "T00:00:00")) + 1;
   const weekLabels = new Array(weekCount).fill("");
@@ -224,7 +235,6 @@ function renderCalendar(data) {
     else lastMonthLabel = v;
   });
 
-  const max = data.calendar.max || 1;
   chart.setOption({
     backgroundColor: "transparent",
     grid: { left: 42, right: 18, top: 34, bottom: 38, containLabel: false },
@@ -283,9 +293,44 @@ function renderCalendar(data) {
         borderColor: COLORS.paper2,
         borderRadius: 1,
       },
+      label: {
+        show: true,
+        fontFamily: MONO,
+        fontSize: 9,
+        color: COLORS.ink,
+        textBorderColor: "rgba(250, 246, 236, 0.92)",
+        textBorderWidth: 2,
+        formatter: (p) => {
+          const v = p.data ? p.data.revenue : 0;
+          if (!v) return "";
+          return v >= 10 ? v.toFixed(1) : v.toFixed(2);
+        },
+      },
       emphasis: { itemStyle: { borderColor: COLORS.ink, borderWidth: 1 } },
     }],
   }, true);
+
+  // 月份合计横条：不用悬停也能看到每月赚了多少
+  const monthMap = new Map();
+  days.forEach((d) => {
+    const m = d.date.slice(0, 7);
+    const cur = monthMap.get(m) || { revenue: 0, orders: 0 };
+    cur.revenue += d.revenue;
+    cur.orders += d.orders;
+    monthMap.set(m, cur);
+  });
+  const now = new Date();
+  const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const monthEl = $("#calMonths");
+  if (monthEl) {
+    monthEl.innerHTML = Array.from(monthMap.entries())
+      .map(([m, v]) => {
+        const label = `${Number(m.slice(5))}月`;
+        return `<span class="${m === thisMonth ? "cur" : ""}">${label}<b>${v.revenue ? fmtMoney(v.revenue) : "¥0"}</b>
+          <span>${v.orders} 单</span></span>`;
+      })
+      .join("");
+  }
 
   if (!chart.__bound) {
     chart.on("click", (params) => {
@@ -652,6 +697,7 @@ async function loadData() {
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     state.data = data;
+    state.lastLoadAt = Date.now();
     renderAll(data);
     if (!state.loaded) state.loaded = true;
     $("#errorBanner").hidden = true;
@@ -694,7 +740,41 @@ function bind() {
     }, 120);
   });
 
-  setInterval(loadData, 20000);
+  // 刷新频率：默认 10 分钟，可切到手动/每分钟/每小时，选择记在本地
+  const stored = localStorage.getItem(REFRESH_KEY);
+  if (stored && REFRESH_LABELS[stored]) {
+    state.refreshMs = Number(stored);
+    $("#refreshSelect").value = stored;
+  }
+  $("#refreshSelect").addEventListener("change", (e) => {
+    state.refreshMs = Number(e.target.value);
+    localStorage.setItem(REFRESH_KEY, e.target.value);
+    $("#refreshNote").textContent = REFRESH_LABELS[e.target.value];
+    scheduleRefresh();
+  });
+  $("#refreshNote").textContent = REFRESH_LABELS[String(state.refreshMs)];
+
+  // 页面在后台时不刷新，回到前台且数据过期才补一次
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.refreshMs && state.lastLoadAt) {
+      if (Date.now() - state.lastLoadAt >= state.refreshMs) loadData();
+    }
+  });
+
+  scheduleRefresh();
+}
+
+function scheduleRefresh() {
+  clearTimeout(state.refreshTimer);
+  if (!state.refreshMs) return;
+  state.refreshTimer = setTimeout(async () => {
+    if (document.hidden) {
+      scheduleRefresh();
+      return;
+    }
+    await loadData();
+    scheduleRefresh();
+  }, state.refreshMs);
 }
 
 bind();

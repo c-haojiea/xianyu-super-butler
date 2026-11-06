@@ -32,12 +32,18 @@
         <span class="live-time" id="updatedAt">连接中</span>
       </div>
       <button class="refresh-btn" id="refreshBtn" type="button" title="立即刷新">刷新数据</button>
+      <select class="refresh-select" id="refreshSelect" title="自动刷新频率">
+        <option value="0">手动刷新</option>
+        <option value="60000">每分钟</option>
+        <option value="600000" selected>每 10 分钟</option>
+        <option value="3600000">每小时</option>
+      </select>
     </div>
   </header>
 
   <div class="ticker">
     <span class="ticker-label">数据口径</span>
-    <span>本地订单库 · 每 20 秒自动刷新 · 金额为买家实付，未扣平台服务费 · <span id="tickerNote">等待数据</span></span>
+    <span>本地订单库 · <span id="refreshNote">每 10 分钟自动刷新</span> · 金额为买家实付，未扣平台服务费 · <span id="tickerNote">等待数据</span></span>
   </div>
 
   <div class="error-banner" id="errorBanner" hidden>数据读取失败：<span id="errorText"></span></div>
@@ -50,10 +56,11 @@
         <div class="head-index">01</div>
         <div class="head-copy">
           <h2>每日成交 · 日历</h2>
-          <p>过去 12 个月，颜色越深表示当日成交额越高。点击任意日期，查看当天卖了什么。</p>
+          <p>从首单月份至今，格子里直接标出当天成交额，颜色越深金额越高。点击任意日期，查看当天卖了什么。</p>
         </div>
         <div class="panel-meta" id="calendarMeta"></div>
       </div>
+      <div class="cal-months" id="calMonths"></div>
       <div class="chart chart-calendar" id="calendarChart"></div>
       <div class="calendar-foot">
         <span class="cal-hint">颜色越深 = 当日成交额越高 · 点击任意格子查看当天订单</span>
