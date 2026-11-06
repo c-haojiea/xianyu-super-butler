@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta
@@ -83,37 +84,84 @@ recent = con.execute(
     "select o.created_at, o.item_id, o.order_status, o.amount, "
     "(select i.item_title from item_info i where i.item_id=o.item_id and i.cookie_id=o.cookie_id limit 1) as title "
     "from orders o where o.created_at >= ? and o.created_at < ? and o.order_status != 'cancelled' "
-    "order by o.created_at desc limit 5",
+    "order by o.created_at desc",
     (today_start.strftime("%Y-%m-%d %H:%M:%S"), tomorrow.strftime("%Y-%m-%d %H:%M:%S")),
 ).fetchall()
+
+# 今日商品小计（同款合并）
+goods = {}
+for r in recent:
+    key = (r[4] or r[1] or "未识别商品").strip()
+    g = goods.setdefault(key, {"count": 0, "amount": 0.0})
+    g["count"] += 1
+    g["amount"] += money(r[3])
+
+# 待发货明细（有就列出来，方便直接处理）
+pending_rows = con.execute(
+    "select o.created_at, o.item_id, o.amount, "
+    "(select i.item_title from item_info i where i.item_id=o.item_id and i.cookie_id=o.cookie_id limit 1) as title "
+    "from orders o where o.order_status='pending_ship' and o.system_shipped=0 "
+    "order by o.created_at",
+).fetchall()
+
+
+def short(text, width=24):
+    text = (text or "").strip() or "未知商品"
+    return text if len(text) <= width else text[:width] + "…"
 
 print(f"──────────── 今日经营概览 {now:%Y-%m-%d} ────────────")
 status_text = " / ".join(
     f"{STATUS_LABEL.get(k, k)} {v}" for k, v in sorted(t["status"].items())
 ) or "无"
-print(f"今日订单   {t['count']} 笔（{status_text}）")
+cancel_note = f" · 取消 {t['cancelled']}" if t["cancelled"] else ""
+print(f"今日订单   {t['count']} 笔（{status_text}{cancel_note}）")
 print(f"今日买家   {t['buyers']} 人")
 print(f"今日销售额 ¥{t['gross']:.2f}（未扣平台费）")
 print(f"今日退款   ¥{t['refund']:.2f}")
 print(f"今日净收入 ¥{t['net']:.2f}")
 avg = t["net"] / t["count"] if t["count"] else 0
 print(f"客单价     ¥{avg:.2f}")
-print(f"本月累计   {m['count']} 笔 / ¥{m['net']:.2f}")
+month_avg = m["net"] / now.day if now.day else 0
+print(f"本月累计   {m['count']} 笔 / ¥{m['net']:.2f}（日均 ¥{month_avg:.2f}）")
 diff_count = t["count"] - y["count"]
 diff_money = t["net"] - y["net"]
 print(f"昨日对比   {y['count']} 笔 / ¥{y['net']:.2f}（订单{diff_count:+d}，金额{diff_money:+.2f}）")
 
 if recent:
     print("")
-    print("最近成交：")
+    print(f"今日成交明细（{len(recent)} 笔，按时间倒序）：")
     for r in recent:
-        title = (r[4] or r[1] or "未知商品").strip()
-        if len(title) > 24:
-            title = title[:24] + "…"
-        print(f"  {r[0][11:16]}  {title}  ¥{money(r[3]):.2f}  {STATUS_LABEL.get(r[2], r[2])}")
+        print(f"  {r[0][11:16]}  {short(r[4] or r[1])}  ¥{money(r[3]):.2f}  {STATUS_LABEL.get(r[2], r[2])}")
+
+    print("")
+    print("今日商品小计：")
+    for title, g in sorted(goods.items(), key=lambda kv: (-kv[1]["count"], -kv[1]["amount"])):
+        print(f"  {short(title, 26)}  ×{g['count']}  ¥{g['amount']:.2f}")
 else:
     print("")
-    print("最近成交：今日暂无成交")
+    print("今日成交明细：今日暂无成交")
+
+if pending_rows:
+    print("")
+    print(f"待发货明细（{len(pending_rows)} 笔，需要人工处理）：")
+    for r in pending_rows:
+        print(f"  {r[0][5:16]}  {short(r[3] or r[1])}  ¥{money(r[2]):.2f}")
+
+last_created = con.execute("select max(created_at) from orders").fetchone()[0]
+try:
+    db_mtime = datetime.fromtimestamp(os.path.getmtime(DB))
+except OSError:
+    db_mtime = None
+fresh = []
+if last_created:
+    stamp = last_created[11:16] if last_created[:10] == now.strftime("%Y-%m-%d") else last_created[5:16]
+    fresh.append(f"最新订单 {stamp}")
+if db_mtime:
+    mins = max(int((now - db_mtime).total_seconds() // 60), 0)
+    fresh.append(f"库文件更新 {db_mtime:%H:%M}（{mins} 分钟前）")
+if fresh:
+    print("")
+    print("数据新鲜度 " + " · ".join(fresh))
 
 print("")
 print("说明：金额取自本地订单实付，未扣平台服务费；以订单库为准。")
