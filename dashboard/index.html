@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>小店经营看板 · Xianyu Ledger</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2315120e'/%3E%3Ctext x='32' y='44' font-size='38' text-anchor='middle' fill='%23f3ede2' font-family='serif'%3E%E9%97%B2%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+
+  <header class="masthead">
+    <div class="brand">
+      <div class="brand-mark">闲</div>
+      <div class="brand-text">
+        <h1>小店经营看板</h1>
+        <p>XIANYU STORE LEDGER · 本地订单库实时账本</p>
+      </div>
+    </div>
+
+    <div class="mast-date">
+      <div class="date-num" id="dateNum">--.--</div>
+      <div class="date-meta" id="dateMeta">加载中</div>
+    </div>
+
+    <div class="live-box">
+      <div class="live-row">
+        <span class="live-dot" id="liveDot"></span>
+        <span class="live-label">LIVE</span>
+        <span class="live-time" id="updatedAt">连接中</span>
+      </div>
+      <button class="refresh-btn" id="refreshBtn" type="button" title="立即刷新">刷新数据</button>
+    </div>
+  </header>
+
+  <div class="ticker">
+    <span class="ticker-label">数据口径</span>
+    <span>本地订单库 · 每 20 秒自动刷新 · 金额为买家实付，未扣平台服务费 · <span id="tickerNote">等待数据</span></span>
+  </div>
+
+  <div class="error-banner" id="errorBanner" hidden>数据读取失败：<span id="errorText"></span></div>
+
+  <main>
+    <section class="kpis" id="kpis" aria-label="今日核心指标"></section>
+
+    <section class="panel calendar-panel reveal" style="--i:1">
+      <div class="panel-head">
+        <div class="head-index">01</div>
+        <div class="head-copy">
+          <h2>每日成交 · 日历</h2>
+          <p>过去 12 个月，颜色越深表示当日成交额越高。点击任意日期，查看当天卖了什么。</p>
+        </div>
+        <div class="panel-meta" id="calendarMeta"></div>
+      </div>
+      <div class="chart chart-calendar" id="calendarChart"></div>
+      <div class="calendar-foot">
+        <span class="cal-hint">颜色越深 = 当日成交额越高 · 点击任意格子查看当天订单</span>
+        <span class="cal-legend"><span>低</span><i></i><span>高</span><b id="calMax"></b></span>
+      </div>
+      <div class="day-detail" id="dayDetail" hidden></div>
+    </section>
+
+    <section class="panel products-panel reveal" style="--i:2">
+        <div class="panel-head">
+          <div class="head-index">02</div>
+          <div class="head-copy">
+            <h2>商品结构 · 谁在扛销量</h2>
+            <p>按订单量排序。点击任意一行，打开该商品的经营诊断。</p>
+          </div>
+          <div class="panel-meta">TOP 10 / <span id="itemCount">--</span> 个在售</div>
+        </div>
+        <div class="product-layout">
+          <div class="chart chart-products" id="productChart"></div>
+          <div class="table-wrap">
+            <table class="data-table" id="productTable">
+              <thead>
+                <tr>
+                  <th class="col-rank">#</th>
+                  <th>商品</th>
+                  <th class="col-num" data-sort="orders">订单</th>
+                  <th class="col-num" data-sort="revenue">成交额</th>
+                  <th class="col-num" data-sort="buyers">买家</th>
+                  <th class="col-num" data-sort="repeat_buyers">复购</th>
+                  <th class="col-num" data-sort="active_days">活跃天</th>
+                </tr>
+              </thead>
+              <tbody id="productBody"></tbody>
+            </table>
+          </div>
+        </div>
+    </section>
+
+    <section class="panel insights-panel reveal" style="--i:3">
+        <div class="panel-head">
+          <div class="head-index">03</div>
+          <div class="head-copy">
+            <h2>爆款与冷门 · 归因</h2>
+            <p>基于订单行为、价格、上架时间和品类竞争度做的解释性分析。</p>
+          </div>
+        </div>
+        <div class="insight-columns">
+        <div class="insight-block">
+          <div class="block-title"><span>爆款为什么成立</span><span class="block-count" id="hotCount">--</span></div>
+          <div class="hot-list" id="hotList"></div>
+        </div>
+        <div class="insight-block cold-block">
+          <div class="block-title"><span>冷门卡在哪里</span><span class="block-count" id="coldCount">--</span></div>
+          <div class="cold-list" id="coldList"></div>
+        </div>
+        </div>
+        <div class="insight-block store-block">
+          <div class="block-title"><span>全店结论</span></div>
+          <ul class="store-notes" id="storeNotes"></ul>
+        </div>
+    </section>
+
+    <div class="grid-two lower">
+      <section class="panel time-panel reveal" style="--i:4">
+        <div class="panel-head">
+          <div class="head-index">04</div>
+          <div class="head-copy">
+            <h2>售卖时段 · 什么时候有人下单</h2>
+            <p>横轴为小时，纵轴为星期。颜色越深，订单越集中。</p>
+          </div>
+          <div class="panel-meta" id="timeMeta"></div>
+        </div>
+        <div class="chart chart-heatmap" id="hourChart"></div>
+        <div class="time-strip" id="timeStrip"></div>
+        <div class="time-notes" id="timeNotes"></div>
+      </section>
+
+      <section class="panel recent-panel reveal" style="--i:5">
+        <div class="panel-head">
+          <div class="head-index">05</div>
+          <div class="head-copy">
+            <h2>最近成交</h2>
+            <p>最近 12 笔订单，按成交时间倒序。</p>
+          </div>
+          <div class="panel-meta" id="recentMeta"></div>
+        </div>
+        <div class="recent-list" id="recentList"></div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span>XIANYU STORE LEDGER / 数据源：本地 SQLite 订单库</span>
+    <span id="footerNote">—</span>
+  </footer>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer" aria-hidden="true">
+    <div class="drawer-head">
+      <span class="drawer-badge" id="drawerBadge">商品诊断</span>
+      <button class="drawer-close" id="drawerClose" type="button">关闭</button>
+    </div>
+    <div class="drawer-body" id="drawerBody"></div>
+  </aside>
+
+  <script src="/assets/echarts.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
