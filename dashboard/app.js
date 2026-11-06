@@ -300,6 +300,8 @@ function renderCalendar(data) {
       axisLabel: { color: COLORS.muted, fontFamily: MONO, fontSize: 9, margin: 8 },
     },
     visualMap: {
+      // 只作用于热力图（series 0）；否则会把角标散点也按色阶染成浅米色
+      seriesIndex: 0,
       min: 0,
       max,
       show: false,
@@ -336,14 +338,14 @@ function renderCalendar(data) {
       },
       emphasis: { itemStyle: { borderColor: COLORS.ink, borderWidth: 1 } },
     }, {
-      // 退款/取消角标：叠加在同一套坐标上的小圆点，往格子顶部偏 8px
+      // 退款/取消角标：叠加在同一套坐标上的墨点，放在格子右上角避开金额数字
       type: "scatter",
       data: flags,
       symbol: "circle",
-      symbolSize: 5,
-      symbolOffset: [0, -8],
-      itemStyle: { color: COLORS.accent, borderColor: COLORS.paper2, borderWidth: 1 },
-      emphasis: { scale: 1.6, itemStyle: { color: COLORS.ink, borderColor: COLORS.accent } },
+      symbolSize: 7,
+      symbolOffset: [14, -6],
+      itemStyle: { color: COLORS.ink, borderColor: COLORS.paper2, borderWidth: 2 },
+      emphasis: { scale: 1.4, itemStyle: { color: COLORS.accent, borderColor: COLORS.paper2 } },
       z: 10,
     }],
   }, true);
@@ -543,8 +545,13 @@ function renderQuality(data) {
   const r = data.refunds || {};
   const w = data.weekly || {};
 
-  const cls = (p) => (p == null ? "qc-flat" : p >= 0 ? "qc-up" : "qc-down");
-  const txt = (p) => (p == null ? "上周无数据" : `${p >= 0 ? "▲" : "▼"} ${Math.abs(p).toFixed(1)}%`);
+  const isFlat = (p) => p != null && Math.abs(p) < 0.05;
+  const cls = (p) => (p == null || isFlat(p) ? "qc-flat" : p > 0 ? "qc-up" : "qc-down");
+  const txt = (p) => {
+    if (p == null) return "上周无数据";
+    if (isFlat(p)) return "持平";
+    return `${p > 0 ? "▲" : "▼"} ${Math.abs(p).toFixed(1)}%`;
+  };
 
   $("#weekCompare").innerHTML = `
     <div class="week-card this">

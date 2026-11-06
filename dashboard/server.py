@@ -128,9 +128,10 @@ def load_data():
         total_buyers = len({o["buyer_id"] for o in valid if o["buyer_id"]})
 
         # 取消 / 退款（全量订单口径：cancelled 也算在分母里）
+        all_count = con.execute("select count(*) from orders").fetchone()[0] or 0
         cancelled = [o for o in orders if o["status"] == "cancelled"]
         cancelled_value = round(sum(o["amount"] for o in cancelled), 2)
-        cancel_rate = round(len(cancelled) / len(orders) * 100, 1) if orders else 0
+        cancel_rate = round(len(cancelled) / all_count * 100, 1) if all_count else 0
         refund_orders_all = [o for o in orders if o["refund"] > 0]
         refund_value = round(sum(o["refund"] for o in refund_orders_all), 2)
         refund_valid = [o for o in refund_orders_all if o["status"] in VALID_STATUS and o["amount"] > 0]
@@ -470,6 +471,11 @@ def load_data():
 
         categories = []
         cat_map = defaultdict(lambda: {"orders": 0, "revenue": 0.0})
+        # item_info 里查不到的商品，单独兜底成「未识别商品」，保证品类合计 = 有效订单数
+        orphans = [o for o in valid if o["item_id"] not in items]
+        if orphans:
+            cat_map["未识别商品"]["orders"] += len(orphans)
+            cat_map["未识别商品"]["revenue"] += sum(o["amount"] for o in orphans)
         for p in products:
             cat_map[p["category"]]["orders"] += p["orders"]
             cat_map[p["category"]]["revenue"] += p["revenue"]
@@ -504,7 +510,7 @@ def load_data():
             },
             "products": {"top": top, "all": products, "cold": cold},
             "refunds": {
-                "total_orders": len(orders),
+                "total_orders": all_count,
                 "cancelled_orders": len(cancelled),
                 "cancelled_value": cancelled_value,
                 "cancel_rate": cancel_rate,
