@@ -216,6 +216,13 @@ function renderCalendar(data) {
       if (ws.getMonth() !== prev.getMonth()) weekLabels[i] = `${ws.getMonth() + 1}月`;
     }
   }
+  // 相邻重复的月份只保留第一个，避免首周与次周都标「8月」
+  let lastMonthLabel = "";
+  weekLabels.forEach((v, i) => {
+    if (!v) return;
+    if (v === lastMonthLabel) weekLabels[i] = "";
+    else lastMonthLabel = v;
+  });
 
   const max = data.calendar.max || 1;
   chart.setOption({
