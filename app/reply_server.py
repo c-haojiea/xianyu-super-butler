@@ -11,6 +11,15 @@ import json
 import os
 import re
 import tempfile
+import mimetypes
+
+# Windows 注册表会把 .js 错误登记为 text/plain，导致 ES Module 脚本被浏览器
+# 以严格 MIME 校验拒绝（白屏）。在挂载静态目录前强制修正常见前端类型。
+mimetypes.add_type('application/javascript; charset=utf-8', '.js')
+mimetypes.add_type('application/javascript; charset=utf-8', '.mjs')
+mimetypes.add_type('text/css; charset=utf-8', '.css')
+mimetypes.add_type('image/svg+xml', '.svg')
+
 import pandas as pd
 import io
 import asyncio

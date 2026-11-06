@@ -807,6 +807,11 @@ frontend/coverage/
 !tests/
 !tests/test_*.py
 
+# 本地敏感配置（含后台管理员密码），禁止提交
+rescue_config.json
+# 保留本项目运维记录
+!升级与测试记录-*.md
+
 # Wrangler 本地缓存（Cloudflare Worker 部署产生）
 .wrangler/
 deploy/.wrangler/

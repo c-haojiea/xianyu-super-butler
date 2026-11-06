@@ -176,6 +176,12 @@ logger.add(
     enqueue=True
 )
 
+# 跨实例共享的 Token/Cookie 异常通知节流：实例重连会重建 last_notification_time，
+# 原来按实例记录会导致每次重连都能再发一条，形成刷屏。这里按 cookie_id 记录到模块级。
+_TOKEN_NOTIFY_LAST = {}
+_TOKEN_NOTIFY_COOLDOWN = 600  # 10 分钟
+
+
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
     _order_locks = defaultdict(lambda: asyncio.Lock())
@@ -895,7 +901,7 @@ class XianyuLive:
         # 通知防重复机制
         self.last_notification_time = {}  # 记录每种通知类型的最后发送时间
         self.notification_cooldown = 300  # 5分钟内不重复发送相同类型的通知
-        self.token_refresh_notification_cooldown = 18000  # Token刷新异常通知冷却时间：3小时
+        self.token_refresh_notification_cooldown = 600  # Token/ Cookie 异常通知冷却：10 分钟
         self.notification_lock = asyncio.Lock()  # 通知防重复机制的异步锁
 
         # 自动发货防重复机制
@@ -5527,16 +5533,17 @@ class XianyuLive:
 
             # 检查是否在冷却期内
             current_time = time.time()
-            last_time = self.last_notification_time.get(notification_type, 0)
-
-            # 为Token刷新异常通知使用特殊的3小时冷却时间
-            # 基于错误消息内容判断是否为Token相关异常
-            if self._is_token_related_error(error_message):
-                cooldown_time = self.token_refresh_notification_cooldown
-                cooldown_desc = "3小时"
+            is_token_error = self._is_token_related_error(error_message)
+            if is_token_error:
+                # 按账号全局节流：重连重建实例也不会重置计时
+                notify_key = f"{self.cookie_id}:token"
+                last_time = _TOKEN_NOTIFY_LAST.get(notify_key, 0)
+                cooldown_time = _TOKEN_NOTIFY_COOLDOWN
             else:
+                notify_key = notification_type
+                last_time = self.last_notification_time.get(notification_type, 0)
                 cooldown_time = self.notification_cooldown
-                cooldown_desc = f"{self.notification_cooldown // 60}分钟"
+            cooldown_desc = f"{cooldown_time // 60}分钟"
 
             if current_time - last_time < cooldown_time:
                 remaining_time = cooldown_time - (current_time - last_time)
@@ -5628,16 +5635,12 @@ class XianyuLive:
 
             # 如果成功发送了通知，更新最后发送时间
             if notification_sent:
-                self.last_notification_time[notification_type] = current_time
-
-                # 根据错误消息内容使用不同的冷却时间
-                if self._is_token_related_error(error_message):
-                    next_send_time = current_time + self.token_refresh_notification_cooldown
-                    cooldown_desc = "3小时"
+                if is_token_error:
+                    _TOKEN_NOTIFY_LAST[notify_key] = current_time
                 else:
-                    next_send_time = current_time + self.notification_cooldown
-                    cooldown_desc = f"{self.notification_cooldown // 60}分钟"
+                    self.last_notification_time[notification_type] = current_time
 
+                next_send_time = current_time + cooldown_time
                 next_send_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_send_time))
                 logger.info(f"Token刷新通知已发送，下次可发送时间: {next_send_time_str} (冷却时间: {cooldown_desc})")
 
@@ -5671,7 +5674,7 @@ class XianyuLive:
         return False
 
     def _is_token_related_error(self, error_message: str) -> bool:
-        """检查是否是Token相关的错误，需要使用3小时冷却时间"""
+        """检查是否是Token相关的错误，使用统一的通知冷却时间"""
         # Token相关错误的关键词
         token_error_keywords = [
             # Token刷新失败相关
@@ -5681,6 +5684,12 @@ class XianyuLive:
             'token刷新异常',
             'TOKEN刷新失败',
             'TOKEN刷新异常',
+            # Cookie / Session 失效同样按 Token 异常节流
+            'Cookie验证失败',
+            'Cookie已失效',
+            'Cookie失效',
+            'Session过期',
+            '未配置用户名或密码',
             # 具体的Token错误信息
             'FAIL_SYS_USER_VALIDATE',
             'RGV587_ERROR',
@@ -9781,6 +9790,27 @@ class XianyuLive:
                 return
 
             from app.db_manager import db_manager
+
+            # 只回本人发布的商品：用小号逛同行/下单时，会话商品不在本账号商品库，
+            # 继续回复会把客服话术发给同行卖家。商品库为空（同步异常）时不拦截，避免全哑。
+            if item_id and not str(item_id).startswith("auto_"):
+                if (db_manager.get_item_info(self.cookie_id, str(item_id)) is None
+                        and db_manager.get_items_by_cookie(self.cookie_id)):
+                    self._add_reply_decision_log(
+                        message_data,
+                        **log_context,
+                        process_status="skipped",
+                        decision_reason="not_own_item",
+                        reply_strategy="none",
+                        matched_keyword=None,
+                        send_status="unknown",
+                    )
+                    logger.info(
+                        f"[{msg_time}] 【{self.cookie_id}】商品 {item_id} 不在本账号商品库，"
+                        f"判定当前为买家身份，跳过自动回复"
+                    )
+                    return
+
             matched_filter = db_manager.matches_message_filter(
                 self.cookie_id, send_message, "skip_reply"
             )
