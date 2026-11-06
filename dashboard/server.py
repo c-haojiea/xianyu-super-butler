@@ -1,7 +1,10 @@
 import json
 import os
+import socket
 import sqlite3
 import sys
+import threading
+import webbrowser
 from collections import defaultdict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -462,11 +465,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found", "text/plain; charset=utf-8")
 
 
+def _port_busy(port):
+    # HTTPServer 默认 allow_reuse_address=1，Windows 下第二个实例仍能绑定同端口，
+    # 所以先探测一次是否真的已有服务在监听。
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        PORT = int(sys.argv[1])
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"dashboard running: http://localhost:{PORT}  db={DB_PATH}")
+    argv = sys.argv[1:]
+    params = [a for a in argv if not a.startswith("-")]
+    if params:
+        PORT = int(params[0])
+    try:
+        if _port_busy(PORT):
+            raise OSError("port in use")
+        server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError:
+        print(f"{PORT} 已被占用，数据看板可能已在运行，直接访问 http://localhost:{PORT}", flush=True)
+        sys.exit(1)
+    print(f"dashboard running: http://localhost:{PORT}  db={DB_PATH}", flush=True)
+    if "--open" in argv:
+        threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
