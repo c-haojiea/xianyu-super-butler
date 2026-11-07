@@ -7260,20 +7260,24 @@ class DBManager:
                 cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
                 existing = cursor.fetchone()
 
-                # [LOCAL-PATCH] D3：平台异步回写会把 chat_id 写进 item_id/buyer_id（三次都发生在补发之后）。
-                # 这里是订单字段的唯一写入口，直接拦掉并留痕，避免污染正常订单。上游合并时需重放，勿删。
+                # [LOCAL-PATCH] D3：平台异步回写会把 chat_id / 附件 id 写进 item_id、把 chat_id 写进 buyer_id
+                # （16:06 实测真实单 item_id 被写成 "4391977095894.PNM"）。这里是订单字段的唯一写入口，
+                # 直接拦掉并留痕，避免污染正常订单。上游合并时需重放，勿删。
                 try:
                     safe_chat = str(chat_id or "")
                     if not safe_chat and existing:
                         cursor.execute("SELECT chat_id FROM orders WHERE order_id = ?", (order_id,))
                         _chat_row = cursor.fetchone()
                         safe_chat = str(_chat_row[0] or "") if _chat_row else ""
-                    if safe_chat:
-                        if item_id is not None and str(item_id) == safe_chat:
+                    if item_id is not None:
+                        _sitem = str(item_id)
+                        # 只拦「会话 id」和附件名（如 4391977095894.PNM）；auto_xxx 这类兜底 id 仍放行
+                        if (_sitem == safe_chat and safe_chat) or "." in _sitem:
                             logger.warning(
-                                f"[LOCAL-PATCH] 拒绝把 chat_id 写入 item_id: order_id={order_id}, chat_id={safe_chat}"
+                                f"[LOCAL-PATCH] 拒绝把非商品ID写入 item_id: order_id={order_id}, item_id={_sitem}"
                             )
                             item_id = None
+                    if safe_chat:
                         if buyer_id is not None and str(buyer_id) == safe_chat:
                             logger.warning(
                                 f"[LOCAL-PATCH] 拒绝把 chat_id 写入 buyer_id: order_id={order_id}, chat_id={safe_chat}"

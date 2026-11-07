@@ -1847,13 +1847,17 @@ class XianyuLive:
     # cookie + 买家/会话查最近 10 分钟待发货单，再走与聊天触发完全相同的
     # _handle_auto_delivery（沿用订单锁 / 冷却 / system_shipped 幂等）。上游合并时需重放。
     async def _fallback_delivery_from_card(self, websocket, message: dict, user_id: str,
-                                           chat_id: str, msg_time: str, delay: float = 2.5):
+                                           chat_id: str, msg_time: str, delay: float = 2.5,
+                                           attempts: int = 3):
         try:
-            await asyncio.sleep(delay)
             from app.db_manager import db_manager
-            rows = db_manager.get_pending_orders_for_buyer(self.cookie_id, user_id, chat_id, minutes=10)
+            for _ in range(max(1, attempts)):
+                await asyncio.sleep(delay)
+                rows = db_manager.get_pending_orders_for_buyer(self.cookie_id, user_id, chat_id, minutes=10)
+                if rows:
+                    break
             if not rows:
-                logger.info(f'[兜底触发] 【{self.cookie_id}】[{msg_time}] 10 分钟内没有待发货订单'
+                logger.info(f'[兜底触发] 【{self.cookie_id}】[{msg_time}] 重试 {attempts} 次后仍无待发货订单'
                             f'（buyer={user_id}, chat={chat_id}），不发货')
                 return
             target = rows[0]
@@ -10413,10 +10417,18 @@ class XianyuLive:
                     # # return 注释掉后又被「非聊天消息」判定丢弃，导致只能靠买家发聊天文字才发货）。
                     # 改为起一个短延迟兜底任务：等订单入库后按买家/会话查库再发货，幂等由订单锁保证。
                     try:
-                        card_chat_raw = ""
-                        if isinstance(message, dict) and isinstance(message.get("1"), dict):
-                            card_chat_raw = message["1"].get("2", "")
-                        card_chat_id = str(card_chat_raw).split("@")[0] if card_chat_raw else ""
+                        # [LOCAL-PATCH] 真实卡片里 message['1'] 可能是字符串 '68624989654@goofish'，
+                        # 会话 id 就在里面；只读 dict 的 ['2'] 会漏掉（16:06 实测 chat 被解析成空）。
+                        card_chat_id = ""
+                        m1 = message.get("1") if isinstance(message, dict) else None
+                        if isinstance(m1, str):
+                            card_chat_id = m1.split("@")[0]
+                        elif isinstance(m1, dict):
+                            for key in ("2", "1", "4"):
+                                val = m1.get(key)
+                                if isinstance(val, str) and val:
+                                    card_chat_id = val.split("@")[0]
+                                    break
                         asyncio.create_task(self._fallback_delivery_from_card(
                             websocket, message, user_id, card_chat_id, msg_time
                         ))
