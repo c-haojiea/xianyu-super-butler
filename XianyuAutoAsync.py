@@ -1843,10 +1843,58 @@ class XianyuLive:
 
         return result
 
+    # [LOCAL-PATCH] D1 系统卡片兜底发货：卡片本身没有订单号，等 2–3 秒后按
+    # cookie + 买家/会话查最近 10 分钟待发货单，再走与聊天触发完全相同的
+    # _handle_auto_delivery（沿用订单锁 / 冷却 / system_shipped 幂等）。上游合并时需重放。
+    async def _fallback_delivery_from_card(self, websocket, message: dict, user_id: str,
+                                           chat_id: str, msg_time: str, delay: float = 2.5):
+        try:
+            await asyncio.sleep(delay)
+            from app.db_manager import db_manager
+            rows = db_manager.get_pending_orders_for_buyer(self.cookie_id, user_id, chat_id, minutes=10)
+            if not rows:
+                logger.info(f'[兜底触发] 【{self.cookie_id}】[{msg_time}] 10 分钟内没有待发货订单'
+                            f'（buyer={user_id}, chat={chat_id}），不发货')
+                return
+            target = rows[0]
+            order_id = str(target.get('order_id') or '')
+            logger.info(
+                f'[兜底触发] 【{self.cookie_id}】[{msg_time}] 候选订单 {len(rows)} 笔: '
+                + ', '.join(f'{r.get("order_id")}({r.get("order_status")},shipped={r.get("system_shipped")})'
+                            for r in rows[:3])
+            )
+            if not order_id:
+                logger.warning(f'[兜底触发] 【{self.cookie_id}】候选订单号为空，跳过')
+                return
+            if int(target.get('system_shipped') or 0):
+                logger.info(f'[兜底触发] 【{self.cookie_id}】订单 {order_id} 已标记发货，跳过')
+                return
+            item_id = str(target.get('item_id') or '')
+            buyer_id = str(target.get('buyer_id') or '') or str(user_id)
+            real_chat = str(target.get('chat_id') or '') or str(chat_id)
+            logger.info(f'[兜底触发] 【{self.cookie_id}】进入发货: order_id={order_id}, '
+                        f'item_id={item_id}, buyer_id={buyer_id}, chat_id={real_chat}')
+            await self._handle_auto_delivery(
+                websocket, message, buyer_id, buyer_id, item_id, real_chat, msg_time,
+                order_id_override=order_id, item_id_override=item_id or None,
+            )
+            after = db_manager.get_order_by_id(order_id) or {}
+            logger.info(
+                f'[兜底触发] 【{self.cookie_id}】发货调用返回: order_id={order_id}, '
+                f'status={after.get("order_status")}, system_shipped={after.get("system_shipped")}'
+            )
+        except Exception as e:
+            logger.warning(f'[兜底触发] 【{self.cookie_id}】兜底发货异常（不影响主流程）: {self._safe_str(e)}')
+
+    # [LOCAL-PATCH] 增加 order_id_override / item_id_override：系统卡片不带订单号，
+    # 兜底任务查库拿到订单后再走同一条发货路径。上游合并时需重放，勿删。
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
-                                   item_id: str, chat_id: str, msg_time: str):
+                                   item_id: str, chat_id: str, msg_time: str,
+                                   order_id_override: str = None, item_id_override: str = None):
         """统一处理自动发货逻辑"""
         try:
+            if item_id_override:
+                item_id = item_id_override
             # 检查商品是否属于当前cookies
             if item_id and item_id != "未知商品":
                 try:
@@ -1861,7 +1909,7 @@ class XianyuLive:
                     return
 
             # 提取订单ID
-            order_id = self._extract_order_id(message)
+            order_id = order_id_override or self._extract_order_id(message)
 
             # 如果order_id不存在，直接返回
             if not order_id:
@@ -10361,6 +10409,21 @@ class XianyuLive:
                 elif red_reminder == '等待卖家发货':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'[{msg_time}] 【系统】交易成功 {user_url} 等待卖家发货')
+                    # [LOCAL-PATCH] D1：系统卡片本身没有订单号，直接调用发货只会空转（历史上这里被
+                    # # return 注释掉后又被「非聊天消息」判定丢弃，导致只能靠买家发聊天文字才发货）。
+                    # 改为起一个短延迟兜底任务：等订单入库后按买家/会话查库再发货，幂等由订单锁保证。
+                    try:
+                        card_chat_raw = ""
+                        if isinstance(message, dict) and isinstance(message.get("1"), dict):
+                            card_chat_raw = message["1"].get("2", "")
+                        card_chat_id = str(card_chat_raw).split("@")[0] if card_chat_raw else ""
+                        asyncio.create_task(self._fallback_delivery_from_card(
+                            websocket, message, user_id, card_chat_id, msg_time
+                        ))
+                        logger.info(f'[兜底触发] 【{self.cookie_id}】[{msg_time}] 已排入系统卡片兜底任务'
+                                    f'（user={user_id}, chat={card_chat_id}）')
+                    except Exception as card_e:
+                        logger.warning(f'[兜底触发] 【{self.cookie_id}】排入兜底任务失败: {self._safe_str(card_e)}')
                     # return
             except:
                 pass
