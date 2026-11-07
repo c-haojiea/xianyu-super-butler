@@ -9035,14 +9035,55 @@ async def manual_ship_orders(
                         failed_count += 1
                         continue
 
-                    if not live_instance.ws or live_instance.ws.closed:
+                    # [LOCAL-PATCH] D2：ws 可能已陈旧（心跳走 HTTP，账号仍显示在线但 ws.closed）。
+                    # 先打诊断日志再最多等 10 秒等连接真正可用；仍不可用则明确失败，绝不假装成功。
+                    ws_obj = None
+                    last_state = None
+                    for attempt in range(20):
+                        candidate = getattr(live_instance, 'ws', None)
+                        try:
+                            from XianyuAutoAsync import ConnectionState
+                            wanted = ConnectionState.CONNECTED
+                        except Exception:
+                            wanted = "connected"
+                        state = getattr(live_instance, 'connection_state', None)
+                        closed = bool(getattr(candidate, 'closed', True)) if candidate is not None else True
+                        last_state = state
+                        if state == wanted and not closed:
+                            ws_obj = candidate
+                            break
+                        await asyncio.sleep(0.5)
+
+                    if ws_obj is None:
+                        _cur = getattr(live_instance, 'ws', None)
+                        _registered = XianyuLive.get_instance(cookie_id)
+                        log_with_user(
+                            'error',
+                            f"WebSocket仍不可用: cookie_id={cookie_id}, instance_id={id(live_instance)}, "
+                            f"connection_state={last_state}, ws_is_none={_cur is None}, "
+                            f"ws_closed={getattr(_cur, 'closed', None) if _cur is not None else 'n/a'}, "
+                            f"ws_obj_id={id(_cur) if _cur is not None else 'n/a'}, "
+                            f"registered_is_self={_registered is live_instance}",
+                            current_user,
+                        )
                         results.append({
                             'order_id': order_id,
                             'success': False,
-                            'message': '该账号WebSocket连接已断开，无法发送消息。请等待重连后重试。'
+                            'message': (
+                                f'该账号WebSocket连接不可用（等待 10 秒仍未就绪），无法发送消息。'
+                                f'当前状态: {last_state}'
+                            )
                         })
                         failed_count += 1
                         continue
+
+                    if attempt > 0:
+                        log_with_user(
+                            'warning',
+                            f"WebSocket等待 {attempt * 0.5:.1f}s 后恢复可用（account={cookie_id}, "
+                            f"state={last_state}）",
+                            current_user,
+                        )
 
                     # 查找与买家的chat_id（优先从订单记录获取，回退到AI对话记录）
                     chat_id = order.get('chat_id') or ''
@@ -9062,7 +9103,7 @@ async def manual_ship_orders(
                         buyer_id=buyer_id,
                         item_id=item_id,
                         chat_id=chat_id,
-                        websocket=live_instance.ws,
+                        websocket=ws_obj,  # [LOCAL-PATCH] D2：用等待后的有效 ws，避免拿到 None/陈旧引用
                         owner_id=user_id,
                     )
                     if protection_result["action"] == "block":
@@ -9149,7 +9190,7 @@ async def manual_ship_orders(
                         try:
                             segment_count = await send_delivery_payload(
                                 live_instance,
-                                live_instance.ws,
+                                ws_obj,  # [LOCAL-PATCH] D2：使用等待验证过的 ws
                                 chat_id,
                                 buyer_id,
                                 content,
