@@ -133,6 +133,42 @@ def repair_order_fields(order_id, before_item, before_buyer):
         conn.close()
 
 
+def read_order_fields(order_id):
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+    try:
+        return conn.execute(
+            "select item_id, buyer_id, chat_id from orders where order_id=?", (order_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+# [LOCAL-PATCH] D3：发货成功后的异步回写会把 item_id/buyer_id 覆盖成 chat_id，
+# 延迟 3 秒复读该行并最多补修 3 次（约 9 秒），每次记日志。上游合并时需重放。
+def verify_and_repair_fields(order_id, before_item, before_buyer, attempts=3, interval=3):
+    for i in range(attempts):
+        time.sleep(interval)
+        row = read_order_fields(order_id)
+        if not row:
+            log(f"  [字段校验] {order_id} 第{i + 1}次: 订单行已不存在，停止校验")
+            return
+        item, buyer, chat_id = row[0], row[1], (row[2] or "")
+        problems = []
+        if chat_id and str(item or "") == str(chat_id):
+            problems.append("item_id=chat_id")
+        if chat_id and str(buyer or "") == str(chat_id):
+            problems.append("buyer_id=chat_id")
+        if before_item and str(item or "") != str(before_item):
+            problems.append(f"item_id变化 {before_item}->{item}")
+        if before_buyer and str(buyer or "") != str(before_buyer):
+            problems.append(f"buyer_id变化 {before_buyer}->{buyer}")
+        if problems:
+            log(f"  [字段修复] {order_id} 第{i + 1}次发现 {'; '.join(problems)}，重新修复")
+            repair_order_fields(order_id, before_item, before_buyer)
+        else:
+            log(f"  [字段校验] {order_id} 第{i + 1}次通过: item_id={item}, buyer_id={buyer}, chat_id={chat_id}")
+
+
 def main():
     if not acquire_lock():
         log("上一轮仍在执行，跳过本轮")
@@ -205,6 +241,7 @@ def main():
                 if ok:
                     state[oid] = {"status": "done", "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "fails": 0}
                     repair_order_fields(oid, before_item, before_buyer)
+                    verify_and_repair_fields(oid, before_item, before_buyer)
                     log(f"  [OK] {oid} 补发成功: {item_result.get('message', '')}")
                 else:
                     st["fails"] = int(st.get("fails", 0)) + 1

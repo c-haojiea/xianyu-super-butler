@@ -7260,6 +7260,28 @@ class DBManager:
                 cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
                 existing = cursor.fetchone()
 
+                # [LOCAL-PATCH] D3：平台异步回写会把 chat_id 写进 item_id/buyer_id（三次都发生在补发之后）。
+                # 这里是订单字段的唯一写入口，直接拦掉并留痕，避免污染正常订单。上游合并时需重放，勿删。
+                try:
+                    safe_chat = str(chat_id or "")
+                    if not safe_chat and existing:
+                        cursor.execute("SELECT chat_id FROM orders WHERE order_id = ?", (order_id,))
+                        _chat_row = cursor.fetchone()
+                        safe_chat = str(_chat_row[0] or "") if _chat_row else ""
+                    if safe_chat:
+                        if item_id is not None and str(item_id) == safe_chat:
+                            logger.warning(
+                                f"[LOCAL-PATCH] 拒绝把 chat_id 写入 item_id: order_id={order_id}, chat_id={safe_chat}"
+                            )
+                            item_id = None
+                        if buyer_id is not None and str(buyer_id) == safe_chat:
+                            logger.warning(
+                                f"[LOCAL-PATCH] 拒绝把 chat_id 写入 buyer_id: order_id={order_id}, chat_id={safe_chat}"
+                            )
+                            buyer_id = None
+                except Exception as guard_err:
+                    logger.warning(f"[LOCAL-PATCH] chat_id 写入拦截检查失败（继续按原逻辑写入）: {guard_err}")
+
                 if existing:
                     # 更新现有订单
                     update_fields = []
@@ -7439,6 +7461,37 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取订单信息失败: {order_id} - {e}")
                 return None
+
+    # [LOCAL-PATCH] 系统卡片兜底发货用：按账号 + 买家/会话查最近 N 分钟内「待发货且未发货」的订单。
+    # 上游合并时需重放，勿删。
+    def get_pending_orders_for_buyer(self, cookie_id: str, buyer_id: str,
+                                     chat_id: str = "", minutes: int = 10):
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT order_id, item_id, buyer_id, chat_id, order_status, system_shipped, created_at "
+                    "FROM orders WHERE cookie_id = ? AND order_status = 'pending_ship' "
+                    "AND COALESCE(system_shipped, 0) = 0 "
+                    "AND created_at >= datetime('now','localtime','-' || ? || ' minutes') "
+                    "AND (buyer_id = ? OR chat_id = ?) ORDER BY created_at ASC",
+                    (cookie_id, int(minutes), str(buyer_id), str(chat_id or "")),
+                )
+                rows = []
+                for row in cursor.fetchall():
+                    rows.append({
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'chat_id': row[3],
+                        'order_status': row[4],
+                        'system_shipped': row[5],
+                        'created_at': row[6],
+                    })
+                return rows
+            except Exception as e:
+                logger.error(f"查询待发货订单失败: {cookie_id} - {e}")
+                return []
 
     def delete_order(self, order_id: str):
         """删除订单"""
