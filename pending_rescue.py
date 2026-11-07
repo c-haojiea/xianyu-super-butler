@@ -13,6 +13,12 @@ LOCK_PATH = os.path.join(ROOT, "data", "pending_rescue.lock")
 STATE_PATH = os.path.join(ROOT, "data", "pending_rescue_state.json")
 DB_PATH = os.environ.get("XY_DB_PATH") or os.path.join(ROOT, "data", "xianyu_data.db")
 
+# [LOCAL-PATCH] G：待发货超时告警。复用与企业微信 Token 异常同一套通知渠道
+# （notification_channels.type='wechat' 的 webhook），不改发货主链路、不改看板。
+ALERT_AFTER_MINUTES = int(os.environ.get("XY_ALERT_AFTER_MINUTES", "15"))
+ALERT_COOLDOWN_MINUTES = int(os.environ.get("XY_ALERT_COOLDOWN_MINUTES", "30"))
+ALERT_DRY_RUN = os.environ.get("XY_ALERT_DRY_RUN", "") not in ("", "0", "false", "False")
+
 
 def log(msg):
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -133,6 +139,136 @@ def repair_order_fields(order_id, before_item, before_buyer):
         conn.close()
 
 
+def load_wechat_webhooks(cookie_id):
+    """读取该账号启用的企业微信渠道 webhook（与 Token 异常通知同一张表）。"""
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "select nc.config from message_notifications mn "
+            "join notification_channels nc on mn.channel_id = nc.id "
+            "where mn.cookie_id = ? and mn.enabled = 1 and nc.enabled = 1 and nc.type = 'wechat'",
+            (cookie_id,),
+        ).fetchall()
+    except Exception as exc:
+        log(f"  [告警] 读取通知渠道失败: {exc}")
+        return []
+    finally:
+        conn.close()
+    urls = []
+    for (cfg,) in rows:
+        try:
+            data = json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
+        except Exception:
+            continue
+        url = str((data or {}).get("webhook_url") or "").strip()
+        if url:
+            urls.append(url)
+    return urls
+
+
+def send_wechat(webhook_url, message):
+    payload = json.dumps({"msgtype": "text", "text": {"content": message}}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(webhook_url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def find_overdue_orders():
+    """pending_ship 且 system_shipped=0 且已超过 ALERT_AFTER_MINUTES 分钟。"""
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cutoff = (datetime.now() - timedelta(minutes=ALERT_AFTER_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
+        return conn.execute(
+            "select order_id,item_id,buyer_id,chat_id,amount,created_at,cookie_id from orders "
+            "where order_status='pending_ship' and coalesce(system_shipped,0)=0 "
+            "and created_at <= ? order by created_at",
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def item_titles(item_ids):
+    if not item_ids:
+        return {}
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "select item_id, item_title from item_info where item_id in (%s)"
+            % ",".join("?" * len(item_ids)),
+            list(item_ids),
+        ).fetchall()
+        return {str(r[0]): (r[1] or "") for r in rows}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def alert_overdue_orders(state):
+    """同一订单 30 分钟内只提醒一次；返回本轮提醒的订单数。"""
+    overdue = find_overdue_orders()
+    if not overdue:
+        return 0
+    now = datetime.now()
+    titles = item_titles({str(r["item_id"] or "") for r in overdue})
+    groups = {}
+    for row in overdue:
+        oid = row["order_id"]
+        st = dict(state.get(oid) or {})
+        last_alert = str(st.get("alert_at") or "")
+        if last_alert:
+            try:
+                gap = (now - datetime.strptime(last_alert, "%Y-%m-%d %H:%M:%S")).total_seconds()
+                if gap < ALERT_COOLDOWN_MINUTES * 60:
+                    continue
+            except ValueError:
+                pass
+        groups.setdefault(str(row["cookie_id"] or ""), []).append((row, st))
+
+    alerted = 0
+    for cookie_id, items in groups.items():
+        webhooks = load_wechat_webhooks(cookie_id)
+        lines = [f"⚠️ 待发货超时提醒（账号 {cookie_id}）", ""]
+        for row, st in items:
+            try:
+                waited = int((now - datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() // 60)
+            except ValueError:
+                waited = ALERT_AFTER_MINUTES
+            lines.append(
+                f"订单 {row['order_id']}\n"
+                f"  商品: {titles.get(str(row['item_id'] or '')) or row['item_id'] or '未知'}\n"
+                f"  金额: ¥{row['amount'] or '0'}\n"
+                f"  下单: {row['created_at']}（已等待 {waited} 分钟）\n"
+                f"  自动补发失败次数: {st.get('fails', 0)}"
+            )
+        lines.append("")
+        lines.append("请尽快处理，超时未发货会被平台处罚。")
+        message = "\n".join(lines)
+
+        if not webhooks:
+            log(f"  [告警] 账号 {cookie_id} 未配置企业微信渠道，跳过 {len(items)} 笔")
+            continue
+        if ALERT_DRY_RUN:
+            log(f"  [告警][DRY-RUN] 账号 {cookie_id} 待推送 {len(items)} 笔:\n{message}")
+        else:
+            for url in webhooks:
+                try:
+                    resp = send_wechat(url, message)
+                    log(f"  [告警] 账号 {cookie_id} 推送 {len(items)} 笔超时订单，渠道响应: {resp[:120]}")
+                except Exception as exc:
+                    log(f"  [告警] 账号 {cookie_id} 推送失败: {exc}")
+        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        for row, st in items:
+            st["alert_at"] = stamp
+            st["last"] = stamp
+            state[row["order_id"]] = st
+            alerted += 1
+    return alerted
+
+
 def read_order_fields(order_id):
     conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
     try:
@@ -243,6 +379,8 @@ def main():
                     repair_order_fields(oid, before_item, before_buyer)
                     verify_and_repair_fields(oid, before_item, before_buyer)
                     log(f"  [OK] {oid} 补发成功: {item_result.get('message', '')}")
+                    # [LOCAL-PATCH] G：发货成功即视为恢复，后续不再提醒
+                    log(f"  [已恢复] {oid} 发货成功，停止超时提醒")
                 else:
                     st["fails"] = int(st.get("fails", 0)) + 1
                     st["last"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -253,6 +391,14 @@ def main():
                 st["last"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 state[oid] = st
                 log(f"  [FAIL] {oid} 调用发货接口异常: {exc} (fails={st['fails']})")
+
+        # [LOCAL-PATCH] G：本轮补发结束后，对仍未发货且超过 15 分钟的订单推一次企业微信提醒
+        try:
+            alerted = alert_overdue_orders(state)
+            if alerted:
+                log(f"本轮超时告警: {alerted} 笔")
+        except Exception as alert_exc:
+            log(f"[告警] 超时提醒异常（不影响补发）: {alert_exc}")
 
         save_state(state)
     except Exception as exc:
