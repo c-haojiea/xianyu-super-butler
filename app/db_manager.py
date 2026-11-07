@@ -7269,38 +7269,60 @@ class DBManager:
                         cursor.execute("SELECT chat_id FROM orders WHERE order_id = ?", (order_id,))
                         _chat_row = cursor.fetchone()
                         safe_chat = str(_chat_row[0] or "") if _chat_row else ""
+                    # [LOCAL-PATCH] F1：cookie_id 未传时回读该行，避免「账号 id 当买家」漏拦
+                    safe_cookie = str(cookie_id or "")
+                    if not safe_cookie and existing:
+                        cursor.execute("SELECT cookie_id FROM orders WHERE order_id = ?", (order_id,))
+                        _cookie_row = cursor.fetchone()
+                        safe_cookie = str((_cookie_row[0] if _cookie_row else "") or "")
                     if item_id is not None:
                         _sitem = str(item_id)
-                        _reject_item = False
-                        _cookie = str(cookie_id or "")
-                        # [LOCAL-PATCH] E2：白名单化——只接受 item_info 里存在的商品ID；
-                        # 会话 id / 账号 id / 附件名（含 .）/ 库里查不到的一律拒绝，auto_ 兜底 id 放行。
-                        if _sitem and (
+                        # [LOCAL-PATCH] F1：只拦「覆盖」，不拦「首写」。硬条件（会话 id / 账号 id / 附件名）
+                        # 一律拒；item_info 查不到时，若已有合法商品ID则拒绝覆盖，否则放行并告警等商品同步补齐。
+                        _hard_reject = bool(_sitem) and (
                             (safe_chat and _sitem == safe_chat)
                             or "." in _sitem
-                            or (_cookie and _sitem == _cookie)
-                        ):
-                            _reject_item = True
-                        elif _sitem and not _sitem.startswith("auto_"):
+                            or (safe_cookie and _sitem == safe_cookie)
+                        )
+                        _in_item_info = False
+                        if _sitem.startswith("auto_"):
+                            _in_item_info = True
+                        elif _sitem and not _hard_reject:
                             try:
                                 cursor.execute("SELECT 1 FROM item_info WHERE item_id = ? LIMIT 1", (_sitem,))
-                                if cursor.fetchone() is None:
-                                    _reject_item = True
+                                _in_item_info = cursor.fetchone() is not None
                             except Exception as lookup_err:
+                                _in_item_info = True  # 查询异常按放行，避免误伤正常写入
                                 logger.warning(f"[LOCAL-PATCH] item_info 白名单查询失败（按通过处理）: {lookup_err}")
-                        if _reject_item:
+                        if _hard_reject:
                             logger.warning(
-                                f"[LOCAL-PATCH] 拒绝非 item_info 商品ID写入 item_id: order_id={order_id}, item_id={_sitem}"
+                                f"[LOCAL-PATCH] 拒绝会话/账号/附件ID写入 item_id: order_id={order_id}, item_id={_sitem}"
                             )
                             item_id = None
+                        elif not _in_item_info:
+                            _prev_item = ""
+                            if existing:
+                                cursor.execute("SELECT item_id FROM orders WHERE order_id = ?", (order_id,))
+                                _prev_row = cursor.fetchone()
+                                _prev_item = str((_prev_row[0] if _prev_row else "") or "")
+                            if _prev_item and not _prev_item.startswith("auto_"):
+                                logger.warning(
+                                    f"[LOCAL-PATCH] 拒绝用 item_info 之外的值覆盖已有商品ID: "
+                                    f"order_id={order_id}, old={_prev_item}, new={_sitem}"
+                                )
+                                item_id = None
+                            else:
+                                logger.warning(
+                                    f"[LOCAL-PATCH] item_id={_sitem} 暂不在 item_info，首次写入放行"
+                                    f"（等商品同步补齐）: order_id={order_id}"
+                                )
                     if buyer_id is not None:
                         _sbuyer = str(buyer_id)
-                        _cookie = str(cookie_id or "")
-                        # [LOCAL-PATCH] E2：buyer_id 拒绝占位 users / 会话 id / 账号 id
+                        # [LOCAL-PATCH] E2：buyer_id 拒绝占位 / 会话 id / 账号 id
                         if (
                             _sbuyer in ("unknown_user", "")
                             or (safe_chat and _sbuyer == safe_chat)
-                            or (_cookie and _sbuyer == _cookie)
+                            or (safe_cookie and _sbuyer == safe_cookie)
                         ):
                             logger.warning(
                                 f"[LOCAL-PATCH] 拒绝占位/会话/账号ID写入 buyer_id: order_id={order_id}, buyer_id={_sbuyer}"
@@ -7458,7 +7480,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
                        quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id,
-                       seller_note
+                       seller_note, system_shipped
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -7481,7 +7503,9 @@ class DBManager:
                         'updated_at': row[11],
                         'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
                         'chat_id': row[13] if len(row) > 13 else '',
-                        'seller_note': row[14] or '' if len(row) > 14 else ''
+                        'seller_note': row[14] or '' if len(row) > 14 else '',
+                        # [LOCAL-PATCH] F3：兜底日志需要真实发货标记，别打 None
+                        'system_shipped': row[15] if len(row) > 15 else None,
                     }
                 return None
 

@@ -1901,16 +1901,26 @@ class XianyuLive:
                     f'[兜底触发] 【{self.cookie_id}】订单 {order_id} 商品归属仍无法确认，跳过发货（需人工处理）'
                 )
                 return
+            # [LOCAL-PATCH] F3：通知文案用买家昵称，别传一串数字 id（查不到就用「买家」）
+            nick = ""
+            try:
+                _order_now = db_manager.get_order_by_id(order_id) or {}
+                nick = str(_order_now.get('receiver_name') or '').strip()
+            except Exception:
+                nick = ""
+            send_name = nick or "买家"
             logger.info(f'[兜底触发] 【{self.cookie_id}】进入发货: order_id={order_id}, '
-                        f'item_id={item_id}, buyer_id={buyer_id}, chat_id={real_chat}')
+                        f'item_id={item_id}, buyer_id={buyer_id}, chat_id={real_chat}, nick={send_name}')
             await self._handle_auto_delivery(
-                websocket, message, buyer_id, buyer_id, item_id, real_chat, msg_time,
+                websocket, message, send_name, buyer_id, item_id, real_chat, msg_time,
                 order_id_override=order_id, item_id_override=item_id or None,
             )
             after = db_manager.get_order_by_id(order_id) or {}
+            _sh = after.get("system_shipped")
             logger.info(
                 f'[兜底触发] 【{self.cookie_id}】发货调用返回: order_id={order_id}, '
-                f'status={after.get("order_status")}, system_shipped={after.get("system_shipped")}'
+                f'status={after.get("order_status")}, '
+                f'system_shipped={"未知" if _sh is None else _sh}'
             )
         except Exception as e:
             logger.warning(f'[兜底触发] 【{self.cookie_id}】兜底发货异常（不影响主流程）: {self._safe_str(e)}')
