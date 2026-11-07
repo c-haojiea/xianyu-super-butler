@@ -9052,6 +9052,18 @@ async def manual_ship_orders(
                         if state == wanted and not closed:
                             ws_obj = candidate
                             break
+                        # [LOCAL-PATCH] E1：等到约 5 秒仍未就绪就主动请求看门狗促成重连，不再干等
+                        if attempt == 10:
+                            try:
+                                forced = await live_instance.check_ws_stale(force=True)
+                                log_with_user(
+                                    'warning',
+                                    f"等待 5 秒仍未就绪，已请求 ws 看门狗强制重连: triggered={forced}, "
+                                    f"state={state}, ws_closed={closed}",
+                                    current_user,
+                                )
+                            except Exception as probe_err:
+                                log_with_user('warning', f"调用 ws 看门狗失败: {probe_err}", current_user)
                         await asyncio.sleep(0.5)
 
                     if ws_obj is None:

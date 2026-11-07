@@ -7271,16 +7271,39 @@ class DBManager:
                         safe_chat = str(_chat_row[0] or "") if _chat_row else ""
                     if item_id is not None:
                         _sitem = str(item_id)
-                        # 只拦「会话 id」和附件名（如 4391977095894.PNM）；auto_xxx 这类兜底 id 仍放行
-                        if (_sitem == safe_chat and safe_chat) or "." in _sitem:
+                        _reject_item = False
+                        _cookie = str(cookie_id or "")
+                        # [LOCAL-PATCH] E2：白名单化——只接受 item_info 里存在的商品ID；
+                        # 会话 id / 账号 id / 附件名（含 .）/ 库里查不到的一律拒绝，auto_ 兜底 id 放行。
+                        if _sitem and (
+                            (safe_chat and _sitem == safe_chat)
+                            or "." in _sitem
+                            or (_cookie and _sitem == _cookie)
+                        ):
+                            _reject_item = True
+                        elif _sitem and not _sitem.startswith("auto_"):
+                            try:
+                                cursor.execute("SELECT 1 FROM item_info WHERE item_id = ? LIMIT 1", (_sitem,))
+                                if cursor.fetchone() is None:
+                                    _reject_item = True
+                            except Exception as lookup_err:
+                                logger.warning(f"[LOCAL-PATCH] item_info 白名单查询失败（按通过处理）: {lookup_err}")
+                        if _reject_item:
                             logger.warning(
-                                f"[LOCAL-PATCH] 拒绝把非商品ID写入 item_id: order_id={order_id}, item_id={_sitem}"
+                                f"[LOCAL-PATCH] 拒绝非 item_info 商品ID写入 item_id: order_id={order_id}, item_id={_sitem}"
                             )
                             item_id = None
-                    if safe_chat:
-                        if buyer_id is not None and str(buyer_id) == safe_chat:
+                    if buyer_id is not None:
+                        _sbuyer = str(buyer_id)
+                        _cookie = str(cookie_id or "")
+                        # [LOCAL-PATCH] E2：buyer_id 拒绝占位 users / 会话 id / 账号 id
+                        if (
+                            _sbuyer in ("unknown_user", "")
+                            or (safe_chat and _sbuyer == safe_chat)
+                            or (_cookie and _sbuyer == _cookie)
+                        ):
                             logger.warning(
-                                f"[LOCAL-PATCH] 拒绝把 chat_id 写入 buyer_id: order_id={order_id}, chat_id={safe_chat}"
+                                f"[LOCAL-PATCH] 拒绝占位/会话/账号ID写入 buyer_id: order_id={order_id}, buyer_id={_sbuyer}"
                             )
                             buyer_id = None
                 except Exception as guard_err:

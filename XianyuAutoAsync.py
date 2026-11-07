@@ -983,6 +983,9 @@ class XianyuLive:
 
         # WebSocket连接监控
         self.connection_state = ConnectionState.DISCONNECTED  # 连接状态
+        # [LOCAL-PATCH] E1：ws 陈旧看门狗状态（时间戳/退避），上游合并时需重放，勿删
+        self._ws_stale_since = 0.0
+        self._ws_last_force_reconnect = 0.0
         self.connection_failures = 0  # 连续连接失败次数
         self.max_connection_failures = 5  # 最大连续失败次数
         self.last_successful_connection = 0  # 上次成功连接时间
@@ -1876,6 +1879,28 @@ class XianyuLive:
             item_id = str(target.get('item_id') or '')
             buyer_id = str(target.get('buyer_id') or '') or str(user_id)
             real_chat = str(target.get('chat_id') or '') or str(chat_id)
+            # [LOCAL-PATCH] E2：发货前校验商品归属；不在 item_info 就先拉订单详情纠正，纠正不了就跳过
+            item_ok = bool(item_id) and bool(db_manager.get_item_info(self.cookie_id, item_id))
+            if not item_ok:
+                logger.warning(
+                    f'[兜底触发] 【{self.cookie_id}】订单 {order_id} 的 item_id={item_id or "(空)"} 不在 item_info，'
+                    f'先拉订单详情纠正'
+                )
+                try:
+                    await self.fetch_order_detail_info(order_id, None, buyer_id)
+                except Exception as fix_err:
+                    logger.warning(f'[兜底触发] 【{self.cookie_id}】纠正 item_id 失败: {self._safe_str(fix_err)}')
+                refreshed = db_manager.get_order_by_id(order_id) or {}
+                item_id = str(refreshed.get('item_id') or '')
+                item_ok = bool(item_id) and bool(db_manager.get_item_info(self.cookie_id, item_id))
+                logger.info(
+                    f'[兜底触发] 【{self.cookie_id}】纠正后 item_id={item_id}（校验{"通过" if item_ok else "失败"}）'
+                )
+            if not item_ok:
+                logger.warning(
+                    f'[兜底触发] 【{self.cookie_id}】订单 {order_id} 商品归属仍无法确认，跳过发货（需人工处理）'
+                )
+                return
             logger.info(f'[兜底触发] 【{self.cookie_id}】进入发货: order_id={order_id}, '
                         f'item_id={item_id}, buyer_id={buyer_id}, chat_id={real_chat}')
             await self._handle_auto_delivery(
@@ -7253,6 +7278,49 @@ class XianyuLive:
             # 如果被取消，立即重新抛出，不执行后续操作
             raise
 
+    # [LOCAL-PATCH] E1：ws 陈旧看门狗。心跳走 HTTP，账号可能仍「在线」而 ws 已关闭；
+    # 由心跳循环每轮调用，陈旧 ≥30 秒就关闭旧 ws 让主循环重连（不新造连接逻辑）。
+    # 退避：5 分钟内最多强制一次，避免与主循环重连打架。上游合并时需重放，勿删。
+    async def check_ws_stale(self, force: bool = False) -> bool:
+        try:
+            ws = getattr(self, 'ws', None)
+            now = time.time()
+            state = getattr(self, 'connection_state', None)
+            closed = ws is None or bool(getattr(ws, 'closed', False))
+            if state != ConnectionState.CONNECTED or not closed:
+                self._ws_stale_since = 0.0
+                return False
+            if not self._ws_stale_since:
+                self._ws_stale_since = now
+            stale_for = now - self._ws_stale_since
+            if not force and stale_for < 30:
+                return False
+            if now - self._ws_last_force_reconnect < 300:
+                logger.info(
+                    f'[LOCAL-PATCH] 【{self.cookie_id}】ws 仍陈旧但处于退避期'
+                    f'（距上次强制 {now - self._ws_last_force_reconnect:.0f}s < 300s），本轮跳过'
+                )
+                return False
+            self._ws_last_force_reconnect = now
+            self._ws_stale_since = 0.0
+            logger.warning(
+                f'[LOCAL-PATCH] 检测到 ws 陈旧，强制重连: instance_id={id(self)}, '
+                f'state={state}, ws_obj_id={id(ws) if ws is not None else None}, '
+                f'stale_for={stale_for:.1f}s'
+            )
+            self._set_connection_state(ConnectionState.RECONNECTING, "ws 陈旧，强制重连")
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception as close_err:
+                    logger.warning(
+                        f'[LOCAL-PATCH] 【{self.cookie_id}】关闭陈旧 ws 失败（忽略）: {self._safe_str(close_err)}'
+                    )
+            return True
+        except Exception as e:
+            logger.warning(f'[LOCAL-PATCH] 【{self.cookie_id}】ws 看门狗检查异常: {self._safe_str(e)}')
+            return False
+
     async def heartbeat_loop(self, ws):
         """心跳循环"""
         consecutive_failures = 0
@@ -7266,6 +7334,18 @@ class XianyuLive:
                     if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止心跳循环")
                         break
+
+                    # [LOCAL-PATCH] E1：先跑 ws 看门狗（陈旧 ≥30 秒会触发主循环重连）
+                    try:
+                        if await self.check_ws_stale():
+                            logger.warning(
+                                f"【{self.cookie_id}】ws 看门狗已触发强制重连，心跳循环退出等待重建"
+                            )
+                            break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as wd_e:
+                        logger.warning(f"【{self.cookie_id}】ws 看门狗异常: {self._safe_str(wd_e)}")
 
                     # 检查WebSocket连接状态
                     if ws.closed:
