@@ -181,6 +181,11 @@ logger.add(
 _TOKEN_NOTIFY_LAST = {}
 _TOKEN_NOTIFY_COOLDOWN = 600  # 10 分钟
 
+# [LOCAL-PATCH] I1：人工重新登录不能「提醒一次就静默」——首次立即提醒，之后每 30 分钟提醒一次，
+# 直到恢复；与 Token 10 分钟节流用独立键，互不干扰。上游合并时需重放，勿删。
+RELIGIN_NOTIFY_INTERVAL = 1800  # 30 分钟
+_RELIGIN_NOTIFY_STATE = {}  # {cookie_id: {"last": ts, "count": n}}
+
 
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
@@ -245,6 +250,25 @@ class XianyuLive:
                 logger.success(state_msg)
             else:
                 logger.info(state_msg)
+
+            # [LOCAL-PATCH] I1：只有「从需要重新扫码」恢复才发恢复通知，且每个事故周期只发一次
+            if new_state == ConnectionState.CONNECTED and not self._is_relogin_terminal():
+                _rl_state = _RELIGIN_NOTIFY_STATE.get(f"{self.cookie_id}:relogin") or {}
+                should_notify = (
+                    int(_rl_state.get("count") or 0) > 0
+                    and not getattr(self, "_relogin_recovered_notified", False)
+                )
+                if should_notify:
+                    self._relogin_recovered_notified = True
+                    try:
+                        asyncio.get_running_loop().create_task(
+                            self._notify_relogin_recovered(old_state)
+                        )
+                    except Exception as loop_err:
+                        self._relogin_recovered_notified = False
+                        logger.warning(
+                            f"【{self.cookie_id}】恢复通知排队失败（无事件循环）: {self._safe_str(loop_err)}"
+                        )
 
     def _is_relogin_terminal(self) -> bool:
         """判断账号是否已经进入需要人工重新登录的终态。"""
@@ -313,13 +337,24 @@ class XianyuLive:
         return False
 
     async def _notify_relogin_required(self) -> None:
-        """只发送一次人工重新登录通知，避免重连循环刷屏。"""
-        if getattr(self, "_relogin_notification_sent", False):
-            return
-        self._relogin_notification_sent = True
+        """[LOCAL-PATCH] I1：首次立即提醒 + 之后每 30 分钟一次，直到账号恢复或用户重新扫码。"""
         try:
+            key = f"{self.cookie_id}:relogin"
+            state = _RELIGIN_NOTIFY_STATE.setdefault(key, {"last": 0.0, "count": 0})
+            now = time.time()
+            if now - float(state.get("last") or 0) < RELIGIN_NOTIFY_INTERVAL:
+                logger.info(
+                    f"【{self.cookie_id}】重新登录提醒在 30 分钟冷却内，跳过"
+                    f"（已提醒 {state.get('count', 0)} 次）"
+                )
+                return
+            state["last"] = now
+            state["count"] = int(state.get("count") or 0) + 1
+            count = state["count"]
+            prefix = "需要重新扫码登录" if count == 1 else f"仍在离线（第 {count} 次提醒）"
+            self._relogin_notification_sent = True
             await self.send_token_refresh_notification(
-                self.relogin_reason or "闲鱼登录态已失效，请重新扫码登录",
+                f"【{prefix}】{self.relogin_reason or '闲鱼登录态已失效，请重新扫码登录'}",
                 "relogin_required",
             )
         except Exception as notify_error:
@@ -327,6 +362,25 @@ class XianyuLive:
                 f"【{self.cookie_id}】发送重新登录通知失败："
                 f"{self._safe_str(notify_error)}"
             )
+
+    async def _notify_relogin_recovered(self, old_state) -> None:
+        """[LOCAL-PATCH] I1：从「需要重新扫码」状态恢复时发一条恢复通知（每个事故周期只发一次）。"""
+        key = f"{self.cookie_id}:relogin"
+        state = _RELIGIN_NOTIFY_STATE.get(key) or {}
+        count = int(state.get("count") or 0)
+        try:
+            await self.send_token_refresh_notification(
+                f"【账号已恢复在线】{self.cookie_id} 已从「需要重新扫码」恢复（此前提醒 {count} 次）",
+                "relogin_recovered",
+            )
+        except Exception as notify_error:
+            logger.warning(f"【{self.cookie_id}】发送恢复通知失败：{self._safe_str(notify_error)}")
+        finally:
+            # 事故周期结束：计数清零，下一次事故重新从「第 1 次」开始
+            state["count"] = 0
+            state["last"] = 0.0
+            self._relogin_recovered_notified = False
+            self._relogin_notification_sent = False
 
     async def _hold_relogin_terminal(self) -> None:
         """停在人工重登状态，等待扫码/人工验证成功后恢复。"""
@@ -989,6 +1043,8 @@ class XianyuLive:
         # [LOCAL-PATCH] E1：ws 陈旧看门狗状态（时间戳/退避），上游合并时需重放，勿删
         self._ws_stale_since = 0.0
         self._ws_last_force_reconnect = 0.0
+        # [LOCAL-PATCH] I1：恢复通知每个事故周期只发一次
+        self._relogin_recovered_notified = False
         self.connection_failures = 0  # 连续连接失败次数
         self.max_connection_failures = 5  # 最大连续失败次数
         self.last_successful_connection = 0  # 上次成功连接时间
@@ -1047,6 +1103,27 @@ class XianyuLive:
         except Exception:
             return False
 
+    @classmethod
+    def _prune_instance_pool(cls, cookie_id: str, limit: int = 5) -> None:
+        """[LOCAL-PATCH] I3：备选池瘦身——清掉「不可用且 ws 已关闭」的实例，并限制每账号最多 5 个。"""
+        pool = cls._instance_pool.get(cookie_id) or []
+        primary = cls._instances.get(cookie_id)
+        keep = []
+        for inst in pool:
+            if inst is None or inst is primary:
+                continue
+            try:
+                ws = getattr(inst, 'ws', None)
+                ws_closed = ws is None or bool(getattr(ws, 'closed', True))
+            except Exception:
+                ws_closed = True
+            # 可用实例保留；不可用但 ws 仍开着的（可能在连接中）也保留，避免误伤
+            if cls._instance_usable(inst) or not ws_closed:
+                keep.append(inst)
+        if len(keep) > limit:
+            keep = keep[-limit:]
+        cls._instance_pool[cookie_id] = keep
+
     def _register_instance(self):
         """注册当前实例到类级别字典"""
         try:
@@ -1061,11 +1138,13 @@ class XianyuLive:
                 pool = XianyuLive._instance_pool.setdefault(self.cookie_id, [])
                 if self not in pool:
                     pool.append(self)
+                XianyuLive._prune_instance_pool(self.cookie_id)
                 return
             XianyuLive._instances[self.cookie_id] = self
             pool = XianyuLive._instance_pool.setdefault(self.cookie_id, [])
             if self in pool:
                 pool.remove(self)
+            XianyuLive._prune_instance_pool(self.cookie_id)
             logger.warning(f"【{self.cookie_id}】实例已注册到全局字典")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注册实例失败: {self._safe_str(e)}")
@@ -1094,6 +1173,7 @@ class XianyuLive:
     @classmethod
     def get_instance(cls, cookie_id: str):
         """[LOCAL-PATCH] H2：优先返回 CONNECTED 且 ws 可用的实例；没有就遍历同名备选实例挑可用的。"""
+        cls._prune_instance_pool(cookie_id)
         primary = cls._instances.get(cookie_id)
         candidates = [primary] if primary is not None else []
         for inst in cls._instance_pool.get(cookie_id, []):
