@@ -2991,9 +2991,18 @@ async def _process_qr_login_session(
     """快速保存扫码Cookie，再在后台增强Cookie。"""
     started_at = time.perf_counter()
     try:
+        # [LOCAL-PATCH] I2：分步计时——定位到底是哪一步吃掉 30 秒
+        step_t0 = time.perf_counter()
         account_info = await process_qr_login_cookies(
             cookies_info['cookies'],
             cookies_info['unb'],
+            current_user
+        )
+        save_elapsed = time.perf_counter() - step_t0
+        log_with_user(
+            'info',
+            f"[LOCAL-PATCH] qr-save step=save_cookie elapsed={save_elapsed:.2f}s "
+            f"total={time.perf_counter() - started_at:.2f}s",
             current_user
         )
         manager_operation = account_info.pop('_manager_operation', None)
@@ -3016,13 +3025,24 @@ async def _process_qr_login_session(
             f"耗时={time.perf_counter() - started_at:.2f}s",
             current_user
         )
-        await _enhance_qr_login_cookies(
-            session_id=session_id,
-            account_info=account_info,
-            cookies=cookies_info['cookies'],
-            current_user=current_user,
-            manager_operation=manager_operation,
-        )
+        # [LOCAL-PATCH] I2：后台增强改成 fire-and-forget——Cookie 已落库，增强失败/超时不再伪装成「账号保存失败」
+        try:
+            enhance_task = asyncio.create_task(
+                _enhance_qr_login_cookies(
+                    session_id=session_id,
+                    account_info=account_info,
+                    cookies=cookies_info['cookies'],
+                    current_user=current_user,
+                    manager_operation=manager_operation,
+                )
+            )
+            qr_check_tasks[session_id] = enhance_task
+        except Exception as enhance_dispatch_err:
+            log_with_user(
+                'warning',
+                f"[LOCAL-PATCH] qr-save step=dispatch_enhance 失败（账号已保存，不影响）: {enhance_dispatch_err}",
+                current_user
+            )
     except Exception as exc:
         result = {
             'status': 'error',
@@ -3148,7 +3168,14 @@ async def _enhance_qr_login_cookies(
     account_id = account_info['account_id']
     user_id = current_user['user_id']
     started_at = time.perf_counter()
+    # [LOCAL-PATCH] I2：增强分步计时（这一段以前会把主保存一起拖进 30 秒超时）
+    step_t0 = time.perf_counter()
     await _await_cookie_manager_operation(manager_operation, account_id, current_user)
+    log_with_user(
+        'info',
+        f"[LOCAL-PATCH] qr-save step=enhance_manager_op elapsed={time.perf_counter() - step_t0:.2f}s",
+        current_user,
+    )
 
     refresh_success = False
     refresh_error_type = None
@@ -3168,10 +3195,16 @@ async def _enhance_qr_login_cookies(
             cookie_id=account_id,
             user_id=user_id,
         )
+        refresh_t0 = time.perf_counter()
         refresh_success = await temp_instance.refresh_cookies_from_qr_login(
             qr_cookies_str=cookies,
             cookie_id=account_id,
             user_id=user_id,
+        )
+        log_with_user(
+            'info',
+            f"[LOCAL-PATCH] qr-save step=enhance_refresh_cookies elapsed={time.perf_counter() - refresh_t0:.2f}s",
+            current_user,
         )
         if refresh_success:
             updated_cookie_info = db_manager.get_cookie_by_id(account_id)
