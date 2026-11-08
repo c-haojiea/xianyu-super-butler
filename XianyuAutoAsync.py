@@ -203,6 +203,9 @@ class XianyuLive:
 
     # 类级别的实例管理字典，用于API调用
     _instances = {}  # {cookie_id: XianyuLive实例}
+    # [LOCAL-PATCH] H：同名账号的备选实例池（{cookie_id: [实例]}）。临时实例（如「从账号获取商品」
+    # 会 new 一个 XianyuLive）不该顶掉正在连着的活实例。上游合并时需重放，勿删。
+    _instance_pool = {}
     _instances_lock = asyncio.Lock()
     
     # 类级别的密码登录时间记录，用于防止重复登录
@@ -1031,11 +1034,38 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】初始化订单状态处理器失败: {self._safe_str(e)}")
             self.order_status_handler = None
 
+    @staticmethod
+    def _instance_usable(inst) -> bool:
+        """[LOCAL-PATCH] H：CONNECTED 且 ws 未关闭才算可用。"""
+        if inst is None:
+            return False
+        try:
+            if getattr(inst, 'connection_state', None) != ConnectionState.CONNECTED:
+                return False
+            ws = getattr(inst, 'ws', None)
+            return ws is not None and not bool(getattr(ws, 'closed', True))
+        except Exception:
+            return False
+
     def _register_instance(self):
         """注册当前实例到类级别字典"""
         try:
-            # 使用同步方式注册，避免在__init__中使用async
+            prev = XianyuLive._instances.get(self.cookie_id)
+            if prev is not None and prev is not self and XianyuLive._instance_usable(prev):
+                # [LOCAL-PATCH] H1：已有活实例时不接管，只登记为备选，避免空壳（临时 new 出来的实例）顶掉活实例
+                logger.warning(
+                    f'[LOCAL-PATCH] 【{self.cookie_id}】注册表已有活实例，新实例仅登记为备选不接管: '
+                    f'live_instance_id={id(prev)}, live_ws_obj_id={id(getattr(prev, "ws", None))}, '
+                    f'new_instance_id={id(self)}'
+                )
+                pool = XianyuLive._instance_pool.setdefault(self.cookie_id, [])
+                if self not in pool:
+                    pool.append(self)
+                return
             XianyuLive._instances[self.cookie_id] = self
+            pool = XianyuLive._instance_pool.setdefault(self.cookie_id, [])
+            if self in pool:
+                pool.remove(self)
             logger.warning(f"【{self.cookie_id}】实例已注册到全局字典")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注册实例失败: {self._safe_str(e)}")
@@ -1043,6 +1073,10 @@ class XianyuLive:
     def _unregister_instance(self):
         """从类级别字典中注销当前实例"""
         try:
+            # [LOCAL-PATCH] H：备选池里也要摘掉，避免池里留空壳
+            pool = XianyuLive._instance_pool.get(self.cookie_id, [])
+            if self in pool:
+                pool.remove(self)
             # 重连时同一账号会先建新实例再回收旧实例，若无条件删除，
             # 旧实例的清理会把仍在运行的新实例一并抹掉 —— 表现为账号心跳正常、
             # 界面显示「监听中」，完整发货却报「该账号未在线运行」。
@@ -1059,8 +1093,26 @@ class XianyuLive:
 
     @classmethod
     def get_instance(cls, cookie_id: str):
-        """获取指定cookie_id的XianyuLive实例"""
-        return cls._instances.get(cookie_id)
+        """[LOCAL-PATCH] H2：优先返回 CONNECTED 且 ws 可用的实例；没有就遍历同名备选实例挑可用的。"""
+        primary = cls._instances.get(cookie_id)
+        candidates = [primary] if primary is not None else []
+        for inst in cls._instance_pool.get(cookie_id, []):
+            if inst is not primary:
+                candidates.append(inst)
+        usable = [inst for inst in candidates if cls._instance_usable(inst)]
+        if usable:
+            chosen = usable[0]
+            if chosen is not primary:
+                cls._instances[cookie_id] = chosen
+                logger.warning(
+                    f'[LOCAL-PATCH] 【{cookie_id}】get_instance 选中可用实例并提升为主实例: '
+                    f'chosen_instance_id={id(chosen)}, prev_primary_id={id(primary) if primary is not None else None}'
+                )
+                pool = cls._instance_pool.setdefault(cookie_id, [])
+                if chosen in pool:
+                    pool.remove(chosen)
+            return chosen
+        return primary if primary is not None else (candidates[0] if candidates else None)
 
     @classmethod
     def get_all_instances(cls):
@@ -7297,6 +7349,15 @@ class XianyuLive:
             now = time.time()
             state = getattr(self, 'connection_state', None)
             closed = ws is None or bool(getattr(ws, 'closed', False))
+            # [LOCAL-PATCH] H3：状态标签过期——DISCONNECTED 但 ws 其实可用时，修正状态而不是报离线
+            if state == ConnectionState.DISCONNECTED and not closed:
+                logger.warning(
+                    f'[LOCAL-PATCH] 【{self.cookie_id}】状态标签过期（DISCONNECTED），'
+                    f'检测到可用 ws ({id(ws)})，同步修正为 CONNECTED'
+                )
+                self._set_connection_state(ConnectionState.CONNECTED, "看门狗修正过期状态标签")
+                self._ws_stale_since = 0.0
+                return False
             if state != ConnectionState.CONNECTED or not closed:
                 self._ws_stale_since = 0.0
                 return False
