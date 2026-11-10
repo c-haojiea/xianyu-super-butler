@@ -12,6 +12,7 @@ STATUS_LABEL = {
     "cancelled": "已取消",
     "processing": "处理中",
     "refunded": "已退款",
+    "unknown": "未知",
 }
 
 
@@ -43,15 +44,18 @@ def fetch(con, start, end):
 
 def summarize(rows):
     valid = [r for r in rows if r[3] != "cancelled"]
-    gross = sum(money(r[4]) for r in valid)
-    refund = sum(money(r[5]) for r in valid)
-    buyers = len({r[2] for r in valid if r[2]})
+    # [LOCAL-PATCH] 只把「有金额」的单算作成交：他人店铺的卡片被误抓进来时金额为空，
+    # 计入会把订单数虚增、客单价拉低。这类单单独计数，不影响金额与人均。
+    paid = [r for r in valid if money(r[4]) > 0]
+    gross = sum(money(r[4]) for r in paid)
+    refund = sum(money(r[5]) for r in paid)
+    buyers = len({r[2] for r in paid if r[2]})
     pending = [r for r in valid if r[3] == "pending_ship"]
     status_count = {}
-    for r in valid:
+    for r in paid:
         status_count[r[3]] = status_count.get(r[3], 0) + 1
     return {
-        "count": len(valid),
+        "count": len(paid),
         "buyers": buyers,
         "gross": gross,
         "refund": refund,
@@ -60,6 +64,7 @@ def summarize(rows):
         "pending_value": sum(money(r[4]) for r in pending),
         "status": status_count,
         "cancelled": len(rows) - len(valid),
+        "anomaly": len(valid) - len(paid),
     }
 
 
@@ -88,9 +93,11 @@ recent = con.execute(
     (today_start.strftime("%Y-%m-%d %H:%M:%S"), tomorrow.strftime("%Y-%m-%d %H:%M:%S")),
 ).fetchall()
 
-# 今日商品小计（同款合并）
+# 今日商品小计（同款合并；只统计有金额的成交单）
 goods = {}
 for r in recent:
+    if money(r[3]) <= 0:
+        continue
     key = (r[4] or r[1] or "未识别商品").strip()
     g = goods.setdefault(key, {"count": 0, "amount": 0.0})
     g["count"] += 1
@@ -126,12 +133,16 @@ print(f"本月累计   {m['count']} 笔 / ¥{m['net']:.2f}（日均 ¥{month_avg
 diff_count = t["count"] - y["count"]
 diff_money = t["net"] - y["net"]
 print(f"昨日对比   {y['count']} 笔 / ¥{y['net']:.2f}（订单{diff_count:+d}，金额{diff_money:+.2f}）")
+if t["anomaly"]:
+    print(f"异常单据   {t['anomaly']} 笔无金额（多为他人店铺消息误判，不计入以上统计）")
 
 if recent:
     print("")
     print(f"今日成交明细（{len(recent)} 笔，按时间倒序）：")
     for r in recent:
-        print(f"  {r[0][11:16]}  {short(r[4] or r[1])}  ¥{money(r[3]):.2f}  {STATUS_LABEL.get(r[2], r[2])}")
+        amount = money(r[3])
+        tag = "" if amount > 0 else "  ← 无金额，未计入"
+        print(f"  {r[0][11:16]}  {short(r[4] or r[1])}  ¥{amount:.2f}  {STATUS_LABEL.get(r[2], r[2])}{tag}")
 
     print("")
     print("今日商品小计：")

@@ -6201,6 +6201,19 @@ class XianyuLive:
                     result = await fetch_order_detail_simple(order_id, cookie_string, headless=headless_mode)
 
                 if result:
+                    # [LOCAL-PATCH] 防非本店订单污染：他人店铺的「交易成功」卡片会把 orderId 带进来，
+                    # 详情页/接口都取不到数据时（状态未知 + 无金额 + 无规格 + 无收货人）直接丢弃，
+                    # 不建浏览器、不写库。上游合并时需重放，勿删。
+                    _status_raw = str(result.get('order_status') or '').strip().lower()
+                    if (_status_raw in ('', 'unknown')
+                            and not str(result.get('amount') or '').strip()
+                            and not str(result.get('spec_value') or '').strip()
+                            and not str(result.get('receiver_name') or '').strip()):
+                        logger.warning(
+                            f"【{self.cookie_id}】订单 {order_id} 详情全空（状态未知/无金额/无规格/无收货人），"
+                            f"判定为非本店订单，丢弃不写库"
+                        )
+                        return None
                     logger.info(f"【{self.cookie_id}】订单详情获取成功: {order_id}")
                     logger.info(f"【{self.cookie_id}】页面标题: {result.get('title', '未知')}")
 
