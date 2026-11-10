@@ -181,7 +181,7 @@ def find_overdue_orders():
     try:
         cutoff = (datetime.now() - timedelta(minutes=ALERT_AFTER_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
         return conn.execute(
-            "select order_id,item_id,buyer_id,chat_id,amount,created_at,cookie_id from orders "
+            "select order_id,item_id,buyer_id,chat_id,amount,created_at,cookie_id,receiver_name from orders "
             "where order_status='pending_ship' and coalesce(system_shipped,0)=0 "
             "and created_at <= ? order by created_at",
             (cutoff,),
@@ -207,6 +207,25 @@ def item_titles(item_ids):
         conn.close()
 
 
+def account_labels(cookie_ids):
+    """账号显示名：优先备注，其次昵称，查不到回落 ID。"""
+    cookie_ids = [c for c in cookie_ids if c]
+    if not cookie_ids:
+        return {}
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "select id, remark, nickname from cookies where id in (%s)"
+            % ",".join("?" * len(cookie_ids)),
+            cookie_ids,
+        ).fetchall()
+        return {str(r[0]): ((r[1] or r[2] or "").strip() or str(r[0])) for r in rows}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
 def alert_overdue_orders(state):
     """同一订单 30 分钟内只提醒一次；返回本轮提醒的订单数。"""
     overdue = find_overdue_orders()
@@ -214,6 +233,7 @@ def alert_overdue_orders(state):
         return 0
     now = datetime.now()
     titles = item_titles({str(r["item_id"] or "") for r in overdue})
+    accounts = account_labels({str(r["cookie_id"] or "") for r in overdue})
     groups = {}
     for row in overdue:
         oid = row["order_id"]
@@ -231,21 +251,34 @@ def alert_overdue_orders(state):
     alerted = 0
     for cookie_id, items in groups.items():
         webhooks = load_wechat_webhooks(cookie_id)
-        lines = [f"⚠️ 待发货超时提醒（账号 {cookie_id}）", ""]
-        for row, st in items:
+        # [LOCAL-PATCH] 告警文案：账号显示昵称，商品显示标题，时间只留月日时分，去掉单号等噪音。
+        account_label = accounts.get(str(cookie_id), str(cookie_id))
+        waits = []
+        for row, _st in items:
             try:
-                waited = int((now - datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() // 60)
+                waits.append(int((now - datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")).total_seconds() // 60))
             except ValueError:
-                waited = ALERT_AFTER_MINUTES
+                waits.append(ALERT_AFTER_MINUTES)
+        lines = [
+            "⏰ 待发货超时，需要处理",
+            "",
+            f"账号: {account_label}",
+            f"共 {len(items)} 笔，最早已等 {max(waits) if waits else ALERT_AFTER_MINUTES} 分钟",
+            "",
+        ]
+        for idx, (row, st) in enumerate(items, 1):
+            waited = waits[idx - 1] if idx - 1 < len(waits) else ALERT_AFTER_MINUTES
+            buyer = (row["receiver_name"] or "").strip()
+            buyer_text = f"买家 {buyer}" if buyer else "买家未留名"
+            created = str(row["created_at"] or "")[5:16]
+            title = titles.get(str(row["item_id"] or "")) or str(row["item_id"] or "未知商品")
+            extra = f"，自动补发已失败 {st.get('fails', 0)} 次" if int(st.get("fails", 0) or 0) else ""
             lines.append(
-                f"订单 {row['order_id']}\n"
-                f"  商品: {titles.get(str(row['item_id'] or '')) or row['item_id'] or '未知'}\n"
-                f"  金额: ¥{row['amount'] or '0'}\n"
-                f"  下单: {row['created_at']}（已等待 {waited} 分钟）\n"
-                f"  自动补发失败次数: {st.get('fails', 0)}"
+                f"{idx}. {title}\n"
+                f"   ¥{row['amount'] or '0'} · {buyer_text} · {created} 下单，已等 {waited} 分钟{extra}"
             )
         lines.append("")
-        lines.append("请尽快处理，超时未发货会被平台处罚。")
+        lines.append("请尽快发货，超时会被平台处罚。")
         message = "\n".join(lines)
 
         if not webhooks:

@@ -186,6 +186,35 @@ _TOKEN_NOTIFY_COOLDOWN = 600  # 10 分钟
 RELIGIN_NOTIFY_INTERVAL = 1800  # 30 分钟
 _RELIGIN_NOTIFY_STATE = {}  # {cookie_id: {"last": ts, "count": n}}
 
+# [LOCAL-PATCH] 通知文案可读性：消息里显示昵称与商品标题，而不是一长串数字 ID。
+# 上游合并时需重放，勿删。
+def _notify_account_label(cookie_id: str) -> str:
+    """账号显示名：优先备注，其次昵称，最后回落 ID。"""
+    try:
+        from app.db_manager import db_manager
+        info = db_manager.get_cookie_details(str(cookie_id)) or {}
+        return (info.get('remark') or info.get('nickname') or '').strip() or str(cookie_id)
+    except Exception:
+        return str(cookie_id)
+
+
+def _notify_item_label(cookie_id: str, item_id: str) -> str:
+    """商品显示名：优先标题，查不到回落商品 ID。"""
+    item_id = str(item_id or '').strip()
+    if not item_id:
+        return '未知商品'
+    try:
+        from app.db_manager import db_manager
+        info = db_manager.get_item_info(str(cookie_id), item_id) or {}
+        return (info.get('item_title') or '').strip() or item_id
+    except Exception:
+        return item_id
+
+
+def _notify_short_time() -> str:
+    """通知里的时间只保留「月-日 时:分」，够用且不啰嗦。"""
+    return time.strftime('%m-%d %H:%M')
+
 
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
@@ -351,7 +380,7 @@ class XianyuLive:
             state["last"] = now
             state["count"] = int(state.get("count") or 0) + 1
             count = state["count"]
-            prefix = "需要重新扫码登录" if count == 1 else f"仍在离线（第 {count} 次提醒）"
+            prefix = "🔑 需要重新扫码登录" if count == 1 else f"📵 账号仍离线（第 {count} 次提醒）"
             self._relogin_notification_sent = True
             await self.send_token_refresh_notification(
                 f"【{prefix}】{self.relogin_reason or '闲鱼登录态已失效，请重新扫码登录'}",
@@ -370,7 +399,7 @@ class XianyuLive:
         count = int(state.get("count") or 0)
         try:
             await self.send_token_refresh_notification(
-                f"【账号已恢复在线】{self.cookie_id} 已从「需要重新扫码」恢复（此前提醒 {count} 次）",
+                f"【✅ 账号已恢复在线】{_notify_account_label(self.cookie_id)} 已恢复（此前提醒 {count} 次）",
                 "relogin_recovered",
             )
         except Exception as notify_error:
@@ -2365,7 +2394,8 @@ class XianyuLive:
                                     send_user_id,
                                     item_id,
                                     f"订单命中“{protection_result['rule_name']}”并已关闭，仅发送卡券成功",
-                                    chat_id
+                                    chat_id,
+                                    kind="warning"
                                 )
                             elif confirm_required and not platform_confirmed:
                                 await self.send_delivery_failure_notification(
@@ -2373,12 +2403,13 @@ class XianyuLive:
                                     send_user_id,
                                     item_id,
                                     f"卡券已全部发送，但闲鱼确认发货失败，请手动确认：{confirm_error}",
-                                    chat_id
+                                    chat_id,
+                                    kind="failure"
                                 )
                             elif len(delivery_contents) > 1:
-                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {sent_count} 个卡券", chat_id)
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {sent_count} 个卡券", chat_id, kind="success")
                             else:
-                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id, kind="success")
                         else:
                             # 内容可能已从批量卡池取出，自动重试可能重复消耗或重复发送，转人工处理。
                             self.delivery_blocked_orders.add(order_id)
@@ -5223,13 +5254,13 @@ class XianyuLive:
             logger.info(f"📱 找到 {len(notifications)} 个通知渠道配置")
 
             # 构建通知消息
-            notification_msg = f"🚨 接收消息通知\n\n" \
-                             f"账号: {self.cookie_id}\n" \
-                             f"买家: {send_user_name} (ID: {send_user_id})\n" \
-                             f"商品ID: {item_id or '未知'}\n" \
-                             f"聊天ID: {chat_id or '未知'}\n" \
-                             f"消息内容: {send_message}\n" \
-                             f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            # [LOCAL-PATCH] 买家消息用 💬 标题，商品显示标题，去掉聊天ID等内部字段。
+            notification_msg = f"💬 买家消息\n\n" \
+                             f"买家: {send_user_name}\n" \
+                             f"商品: {_notify_item_label(self.cookie_id, item_id)}\n" \
+                             f"内容: {send_message}\n" \
+                             f"时间: {_notify_short_time()}\n" \
+                             f"账号: {_notify_account_label(self.cookie_id)}\n"
 
             # 发送通知到各个渠道
             for i, notification in enumerate(notifications, 1):
@@ -5790,23 +5821,36 @@ class XianyuLive:
                 return
 
             # 构造通知消息
+            # [LOCAL-PATCH] 按类型区分标题与正文：重新登录/恢复类直接使用短文案，
+            # 不再被「Token刷新异常 + 异常信息:」二次包装；账号显示昵称，时间只留月日时分。
+            account_label = _notify_account_label(self.cookie_id)
+            short_time = _notify_short_time()
             # 判断异常信息中是否包含"滑块验证成功"
             if "滑块验证成功" in error_message:
                 notification_msg = f"{error_message}\n\n" \
-                                  f"账号: {self.cookie_id}\n" \
-                                  f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                  f"账号: {account_label}\n" \
+                                  f"时间: {short_time}\n"
             elif verification_url:
                 # 如果有验证链接，添加到消息中
                 notification_msg = f"{error_message}\n\n" \
-                                  f"账号: {self.cookie_id}\n" \
-                                  f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
+                                  f"账号: {account_label}\n" \
+                                  f"时间: {short_time}\n\n" \
                                   f"验证链接: {verification_url}\n"
+            elif notification_type == "relogin_required":
+                notification_msg = f"{error_message}\n\n" \
+                                  f"账号: {account_label}\n" \
+                                  f"时间: {short_time}\n\n" \
+                                  f"打开后台扫码即可恢复：http://localhost:8081\n"
+            elif notification_type == "relogin_recovered":
+                notification_msg = f"{error_message}\n\n" \
+                                  f"账号: {account_label}\n" \
+                                  f"时间: {short_time}\n"
             else:
-                notification_msg = f"Token刷新异常\n\n" \
-                                  f"账号ID: {self.cookie_id}\n" \
-                                  f"异常时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n" \
-                                  f"异常信息: {error_message}\n\n" \
-                                  f"请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。\n"
+                notification_msg = f"🔐 账号登录态异常\n\n" \
+                                  f"账号: {account_label}\n" \
+                                  f"时间: {short_time}\n" \
+                                  f"原因: {error_message}\n\n" \
+                                  f"若反复出现，请在后台重新扫码登录。\n"
 
             logger.info(f"准备发送Token刷新异常通知: {self.cookie_id}")
 
@@ -5944,8 +5988,8 @@ class XianyuLive:
 
         return False
 
-    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None):
-        """发送自动发货失败通知"""
+    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None, kind: str = "failure"):
+        """发送自动发货通知（kind: success / warning / failure 决定标题与结尾提示）"""
         try:
             from app.db_manager import db_manager
 
@@ -5957,14 +6001,24 @@ class XianyuLive:
                 return
 
             # 构造通知消息
-            notification_message = f"🚨 自动发货通知\n\n" \
-                                 f"账号: {self.cookie_id}\n" \
-                                 f"买家: {send_user_name} (ID: {send_user_id})\n" \
-                                 f"商品ID: {item_id}\n" \
-                                 f"聊天ID: {chat_id or '未知'}\n" \
+            # [LOCAL-PATCH] 成功/提醒/失败用不同标题与图标，商品显示标题、账号显示昵称，去掉聊天ID等内部字段。
+            title_map = {
+                "success": "✅ 发货成功",
+                "warning": "⚠️ 发货提醒",
+                "failure": "❌ 发货失败",
+            }
+            title = title_map.get(kind, title_map["failure"])
+            item_label = _notify_item_label(self.cookie_id, item_id)
+            notification_message = f"{title}\n\n" \
+                                 f"商品: {item_label}\n" \
+                                 f"买家: {send_user_name}\n" \
                                  f"结果: {error_message}\n" \
-                                 f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
-                                 f"请及时处理！"
+                                 f"时间: {_notify_short_time()}\n" \
+                                 f"账号: {_notify_account_label(self.cookie_id)}\n"
+            if kind == "failure":
+                notification_message += "\n需要你处理，请到后台订单页查看该单。"
+            elif kind == "warning":
+                notification_message += "\n请留意该单是否需要人工补一步。"
 
             # 发送通知到所有已启用的通知渠道
             for notification in notifications:
