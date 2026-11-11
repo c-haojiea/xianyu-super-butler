@@ -2061,7 +2061,8 @@ def generate_sign(t: str, token: str, data: str) -> str:
 
 
 async def refresh_token(cookies_str: str):
-    new = XianyuLive(cookies_str)
+    # [LOCAL-PATCH] J1：纯工具实例，不注册到全局实例表
+    new = XianyuLive(cookies_str, register_instance=False)
     token = await new.refresh_token()
     cookie_list = list(new.xianyu.session.cookies)
     cookie_list.reverse()

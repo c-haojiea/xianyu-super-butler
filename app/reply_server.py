@@ -2056,6 +2056,8 @@ async def _fetch_and_store_account_profile(
         cookies_str=cookies_str,
         cookie_id=cookie_id,
         user_id=user_id,
+        # [LOCAL-PATCH] J1：临时实例只用于抓资料，不注册，避免顶掉正在监听的活实例
+        register_instance=False,
     )
     result = await instance.fetch_account_profile()
     if not result.get('success'):
@@ -2510,7 +2512,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     temp_xianyu = XianyuLive(
                         cookies_str=cookies_str,
                         cookie_id=account_id,
-                        user_id=user_id
+                        user_id=user_id,
+                        register_instance=False,
                     )
                     
                     # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
@@ -3194,6 +3197,7 @@ async def _enhance_qr_login_cookies(
             cookies_str=cookies,
             cookie_id=account_id,
             user_id=user_id,
+            register_instance=False,
         )
         refresh_t0 = time.perf_counter()
         refresh_success = await temp_instance.refresh_cookies_from_qr_login(
@@ -3301,7 +3305,8 @@ async def refresh_cookies_from_qr_login(
         temp_instance = XianyuLive(
             cookies_str=qr_cookies,
             cookie_id=cookie_id,
-            user_id=current_user['user_id']
+            user_id=current_user['user_id'],
+            register_instance=False,
         )
 
         # 执行cookie刷新
@@ -6795,7 +6800,8 @@ async def get_all_items_from_account(request: dict, current_user: Dict[str, Any]
         xianyu_instance = XianyuLive(
             cookies_str=cookies_str,
             cookie_id=cookie_id,
-            user_id=current_user['user_id']
+            user_id=current_user['user_id'],
+            register_instance=False,
         )
 
         try:
@@ -6910,7 +6916,8 @@ async def get_items_by_page(request: dict, current_user: Dict[str, Any] = Depend
         xianyu_instance = XianyuLive(
             cookies_str=cookies_str,
             cookie_id=cookie_id,
-            user_id=current_user['user_id']
+            user_id=current_user['user_id'],
+            register_instance=False,
         )
 
         try:

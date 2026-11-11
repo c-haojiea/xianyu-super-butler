@@ -941,7 +941,8 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理日志文件时出错: {self._safe_str(e)}")
             return 0
 
-    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None):
+    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None,
+                 register_instance: bool = True):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
 
@@ -1106,7 +1107,10 @@ class XianyuLive:
         self._init_order_status_handler()
 
         # 注册实例到类级别字典（用于API调用）
-        self._register_instance()
+        # [LOCAL-PATCH] J1：临时实例（刷新资料/刷新Cookie等用途，不跑 main 循环）不得注册，
+        # 否则会把正在监听的活实例顶掉，之后发货接口永远拿到 ws=None 的空壳实例。
+        if register_instance:
+            self._register_instance()
 
     def _init_order_status_handler(self):
         """初始化订单状态处理器"""
@@ -1169,6 +1173,22 @@ class XianyuLive:
                     pool.append(self)
                 XianyuLive._prune_instance_pool(self.cookie_id)
                 return
+            # [LOCAL-PATCH] J2：被顶掉的旧实例不能直接丢，放进备选池。
+            # 旧实例可能是真正在监听的活实例（重连中短暂非 CONNECTED），
+            # 丢掉后就变成无法找回的孤儿——心跳正常、界面在线，发货却报「连接不可用」。
+            prev_ws = getattr(prev, 'ws', None)
+            try:
+                prev_ws_open = prev_ws is not None and not bool(getattr(prev_ws, 'closed', True))
+            except Exception:
+                prev_ws_open = False
+            if prev is not None and prev is not self and prev_ws_open:
+                pool = XianyuLive._instance_pool.setdefault(self.cookie_id, [])
+                if prev not in pool:
+                    pool.append(prev)
+                    logger.warning(
+                        f'[LOCAL-PATCH] 【{self.cookie_id}】旧实例 ws 仍打开，保留到备选池: '
+                        f'old_instance_id={id(prev)}, new_instance_id={id(self)}'
+                    )
             XianyuLive._instances[self.cookie_id] = self
             pool = XianyuLive._instance_pool.setdefault(self.cookie_id, [])
             if self in pool:
