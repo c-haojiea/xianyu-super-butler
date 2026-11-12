@@ -10587,7 +10587,24 @@ class XianyuLive:
             # 【优先处理】尝试获取订单ID并获取订单详情
             order_id = None
             try:
-                order_id = self._extract_order_id(message)
+                # [LOCAL-PATCH] K1：自己发出的消息不可能是「本店被下单」的订单。
+                # 原顺序是先解析订单、后判断消息方向（见下方【手动发出】分支），
+                # 导致本人在买家会话里发的「我已付款，等待你发货」被写成 pending_ship 订单，
+                # 巡检每 5 分钟补发一次、每次都失败。这里先判方向，自己的消息直接不解析。
+                _sender_id = ""
+                try:
+                    _m1 = message.get("1")
+                    _m10 = _m1.get("10") if isinstance(_m1, dict) else None
+                    if isinstance(_m10, dict):
+                        _sender_id = str(_m10.get("senderUserId") or "")
+                except Exception:
+                    _sender_id = ""
+                if _sender_id and _sender_id == str(self.myid):
+                    logger.info(
+                        f"【{self.cookie_id}】自己发出的消息，跳过订单解析（sender={_sender_id}）"
+                    )
+                else:
+                    order_id = self._extract_order_id(message)
                 if order_id:
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 检测到订单ID: {order_id}，开始获取订单详情')

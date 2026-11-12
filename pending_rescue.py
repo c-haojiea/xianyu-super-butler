@@ -183,6 +183,9 @@ def find_overdue_orders():
         return conn.execute(
             "select order_id,item_id,buyer_id,chat_id,amount,created_at,cookie_id,receiver_name from orders "
             "where order_status='pending_ship' and coalesce(system_shipped,0)=0 "
+            # [LOCAL-PATCH] K2：没有买家ID的单发不出卡券，不可能是真正待发货，
+            # 多为「本账号作为买家」的会话消息被误解析。不催单、不告警。
+            "and coalesce(buyer_id,'') <> '' "
             "and created_at <= ? order by created_at",
             (cutoff,),
         ).fetchall()
@@ -372,6 +375,8 @@ def main():
             rows = conn.execute(
                 "select order_id, item_id, buyer_id, chat_id, amount, created_at, cookie_id "
                 "from orders where order_status='pending_ship' and system_shipped=0 "
+                # [LOCAL-PATCH] K2：无买家ID无法发卡券，跳过，不空转重试
+                "and coalesce(buyer_id,'') <> '' "
                 "and created_at >= ? and created_at <= ? order by created_at",
                 (max_age.strftime("%Y-%m-%d %H:%M:%S"), min_age.strftime("%Y-%m-%d %H:%M:%S")),
             ).fetchall()
