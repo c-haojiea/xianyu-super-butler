@@ -4671,14 +4671,29 @@ class XianyuLive:
     def extract_item_id_from_message(self, message):
         """从消息中提取商品ID的辅助方法"""
         try:
+            # [LOCAL-PATCH] L2：新版订单卡片形如
+            # {'1': '69130965941@goofish', '3': {'itemId': '1074392075252', 'orderId': '...'}}
+            # message['1'] 是会话ID，原来先从这里扒 \d{10,}，会把会话ID当商品ID写库。
+            # 先取 message['3'].itemId（权威值），再回退旧逻辑，并跳过 @goofish 形态的会话ID。
+            _attach_re = re.compile(r'^\d+\.(pnm|jpe?g|png|gif|webp|mp4|mov)$', re.I)
+            message_3_top = message.get('3')
+            if isinstance(message_3_top, dict):
+                top_item = message_3_top.get('itemId') or message_3_top.get('item_id')
+                if top_item:
+                    logger.info(f"从message[3].itemId提取商品ID: {top_item}")
+                    return str(top_item)
+
             # 方法1: 从message["1"]中提取（如果是字符串格式）
             message_1 = message.get('1')
             if isinstance(message_1, str):
-                # 尝试从字符串中提取数字ID
-                id_match = re.search(r'(\d{10,})', message_1)
-                if id_match:
-                    logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
-                    return id_match.group(1)
+                if message_1.strip().endswith('@goofish'):
+                    logger.info(f"跳过会话ID形态的message[1]: {message_1}")
+                else:
+                    # 尝试从字符串中提取数字ID
+                    id_match = re.search(r'(\d{10,})', message_1)
+                    if id_match:
+                        logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
+                        return id_match.group(1)
 
             # 方法2: 从message["3"]中提取
             message_3 = message.get('3', {})
@@ -4712,7 +4727,7 @@ class XianyuLive:
 
                 # 从消息内容中提取数字ID
                 content = message_3.get('content', '')
-                if isinstance(content, str) and content:
+                if isinstance(content, str) and content and not _attach_re.match(content.strip()):
                     id_match = re.search(r'(\d{10,})', content)
                     if id_match:
                         logger.info(f"【{self.cookie_id}】从消息内容中提取商品ID: {id_match.group(1)}")
@@ -4736,6 +4751,9 @@ class XianyuLive:
                             return result
 
                 elif isinstance(obj, str):
+                    # [LOCAL-PATCH] L2：'xxx@goofish' 是会话ID、'123.PNM' 是附件ID，都不是商品ID
+                    if obj.strip().endswith('@goofish') or _attach_re.match(obj.strip()):
+                        return None
                     # 从字符串中提取可能的商品ID
                     id_match = re.search(r'(\d{10,})', obj)
                     if id_match:
@@ -10777,6 +10795,54 @@ class XianyuLive:
 
             # 判断是否为聊天消息
             if not self.is_chat_message(message):
+                # [LOCAL-PATCH] L1：新版订单卡片 {'1': '会话id@goofish', '3': {订单详情 dict}}，
+                # 既不是聊天消息、也没有 redReminder，原来在这里直接 return，导致订单只入库、
+                # 从不触发发货（2026-11-16 12:52 的 3317020681227004561 因此超时 46 分钟）。
+                # 识别到订单卡片时，先把卡片里的权威字段写回订单，再排入兜底发货。
+                # 安全边界：只有卡片归属本店（itemSellerId/ownerUserId == 本账号）才发货，
+                # 避免「我自己作为买家」的下单卡片触发给卖家发消息。
+                _card = message.get("3") if isinstance(message, dict) else None
+                _card_mine = False
+                if isinstance(_card, dict):
+                    _owners = {
+                        str(_card.get("itemSellerId") or ""),
+                        str(_card.get("ownerUserId") or ""),
+                    }
+                    _card_mine = str(self.myid) in _owners
+                if order_id and _card_mine and (_card.get("orderId") or _card.get("itemId")):
+                    try:
+                        _m1 = message.get("1")
+                        _chat = ""
+                        if isinstance(_m1, str):
+                            _chat = _m1.split("@")[0]
+                        elif isinstance(_m1, dict):
+                            for _k in ("2", "1", "4"):
+                                _v = _m1.get(_k)
+                                if isinstance(_v, str) and _v:
+                                    _chat = _v.split("@")[0]
+                                    break
+                        _buyer = str(_card.get("extUserId") or _card.get("buyerId") or "")
+                        _item = str(_card.get("itemId") or "")
+                        if _item or _buyer or _chat:
+                            from app.db_manager import db_manager
+                            db_manager.insert_or_update_order(
+                                order_id,
+                                item_id=_item or None,
+                                buyer_id=_buyer or None,
+                                cookie_id=self.cookie_id,
+                                chat_id=_chat or None,
+                            )
+                        asyncio.create_task(self._fallback_delivery_from_card(
+                            websocket, message, _buyer or _chat, _chat, msg_time
+                        ))
+                        logger.info(
+                            f'[兜底触发] 【{self.cookie_id}】订单卡片（非聊天消息）已排入发货任务: '
+                            f'order={order_id}, item={_item}, buyer={_buyer}, chat={_chat}'
+                        )
+                    except Exception as card_e:
+                        logger.warning(
+                            f'[兜底触发] 【{self.cookie_id}】订单卡片兜底失败: {self._safe_str(card_e)}'
+                        )
                 logger.warning("非聊天消息")
                 return
 

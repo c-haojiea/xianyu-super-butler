@@ -161,6 +161,12 @@ class SecureConfirm:
                     return {"success": True, "order_id": order_id}
                 else:
                     error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
+                    # [LOCAL-PATCH] L3：平台回「ORDER_ALREADY_DELIVERY::已发货成功」说明订单已是已发货状态，
+                    # 属于成功终态。原来当成失败重试 4 次，最后报「重试次数过多」，
+                    # 让前台显示发货失败（2026-11-16 13:23 实测：卡券已发、平台已发货，却报失败）。
+                    if any(k in str(error_msg) for k in ('ORDER_ALREADY_DELIVERY', '已发货成功')):
+                        logger.info(f"【{self.cookie_id}】✅ 订单已是已发货状态，按成功处理: {error_msg}")
+                        return {"success": True, "order_id": order_id, "already_delivered": True}
                     logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
 
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
