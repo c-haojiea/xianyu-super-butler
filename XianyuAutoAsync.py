@@ -216,6 +216,63 @@ def _notify_short_time() -> str:
     return time.strftime('%m-%d %H:%M')
 
 
+# [LOCAL-PATCH] M3：事件循环卡顿监控。
+# 事件循环一旦被同步调用（阻塞 IO、锁等待等）占住，心跳、发卡券、网页接口会一起停，
+# 但日志也随之停写，事后完全看不出卡在哪。这里用「beat 任务 + 独立线程」在卡顿超过
+# 15 秒时把所有线程栈打进日志，下次复现就能直接定位到具体代码行。
+_LOOP_BEAT = time.time()
+_LOOP_WATCHDOG_STARTED = False
+
+
+async def _loop_beat_loop():
+    global _LOOP_BEAT
+    while True:
+        _LOOP_BEAT = time.time()
+        await asyncio.sleep(0.5)
+
+
+def _install_loop_watchdog():
+    """启动事件循环心跳与卡顿抓栈线程（进程内只启动一次）。"""
+    global _LOOP_BEAT, _LOOP_WATCHDOG_STARTED
+    _LOOP_BEAT = time.time()
+    if _LOOP_WATCHDOG_STARTED:
+        return
+    _LOOP_WATCHDOG_STARTED = True
+
+    import sys as _sys
+    import threading as _threading
+    import traceback as _traceback
+
+    def _watch():
+        last_report = 0.0
+        while True:
+            time.sleep(3)
+            lag = time.time() - _LOOP_BEAT
+            if lag < 15:
+                continue
+            now = time.time()
+            if now - last_report < 120:
+                continue
+            last_report = now
+            try:
+                parts = [
+                    f"\n[LOOP-STALL {time.strftime('%Y-%m-%d %H:%M:%S')}] 事件循环已卡 {lag:.0f} 秒，"
+                    f"以下是各线程当前栈："
+                ]
+                for tid, frame in _sys._current_frames().items():
+                    parts.append(f"--- thread={tid} ---")
+                    parts.extend(_traceback.format_stack(frame)[-6:])
+                logger.error("\n".join(parts))
+            except Exception:
+                pass
+
+    _threading.Thread(target=_watch, name="loop-lag-watcher", daemon=True).start()
+    try:
+        asyncio.get_running_loop().create_task(_loop_beat_loop())
+    except RuntimeError:
+        pass
+
+
 class XianyuLive:
     # 类级别的锁字典，为每个order_id维护一个锁（用于自动发货）
     _order_locks = defaultdict(lambda: asyncio.Lock())
@@ -2361,7 +2418,11 @@ class XianyuLive:
 
                                 else:
                                     # 普通文本发货内容
-                                    await self.send_msg(websocket, chat_id, send_user_id, delivery_content)
+                                    # [LOCAL-PATCH] M1：改用带服务端回执的 send_im_text。
+                                    # 原来走 send_msg（裸 ws.send，fire-and-forget），
+                                    # 2026-11-21 17:19 实测：日志打出「已发送」，买家没收到，
+                                    # 0.5 秒后 ws 断开、卡券再也补不回来，还照常点了确认发货。
+                                    await self.send_im_text(chat_id, send_user_id, delivery_content)
                                     if len(delivery_contents) > 1:
                                         logger.info(f'[{msg_time}] 【多数量自动发货】第 {i+1}/{len(delivery_contents)} 条已向 {user_url} 发送发货内容')
                                     else:
@@ -10860,9 +10921,19 @@ class XianyuLive:
 
                 create_time = int(message_1.get("5", 0))
                 message_10 = message_1["10"]
-                send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
                 send_user_id = message_10.get("senderUserId", "unknown")
                 send_message = message_10.get("reminderContent", "")
+                # [LOCAL-PATCH] M2：昵称缺失时原来回退到 reminderTitle，而它常常就是消息正文，
+                # 于是通知里出现「买家: 买家已拍下，待付款」（2026-11-21 17:13 实测）。
+                # 改为 senderNick → senderUserName → 用户ID → 「买家」，并与正文相同兜底。
+                send_user_name = (
+                    str(message_10.get("senderNick") or "").strip()
+                    or str(message_10.get("senderUserName") or "").strip()
+                    or str(send_user_id or "").strip()
+                    or "买家"
+                )
+                if send_user_name == str(send_message or "").strip():
+                    send_user_name = "买家"
 
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
@@ -11131,6 +11202,10 @@ class XianyuLive:
         """主程序入口"""
         try:
             logger.info(f"【{self.cookie_id}】开始启动XianyuLive主程序...")
+            # [LOCAL-PATCH] M3：事件循环卡顿监控。2026-11-21 17:16 卡了 135 秒，
+            # 期间发卡券延时、巡检报「服务未就绪」、网页无响应，但日志全空、无法定位。
+            # 这里起一个 beat 任务 + 独立线程，卡住超过 15 秒就把各线程栈打到日志。
+            _install_loop_watchdog()
             await self.create_session()  # 创建session
             logger.info(f"【{self.cookie_id}】Session创建完成，开始WebSocket连接循环...")
 
