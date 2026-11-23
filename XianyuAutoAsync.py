@@ -8018,6 +8018,47 @@ class XianyuLive:
         finally:
             logger.info(f"【{self.cookie_id}】订单同步循环已退出")
 
+    async def _sync_orders_after_connect(self, reason: str = ""):
+        """[LOCAL-PATCH] N1：WebSocket 重连后补一次卖出订单同步。
+
+        Token 定时刷新会主动关闭连接换新 Token，断开的那 1～2 秒里下单的订单卡片
+        收不到就永久丢失，本地库没有任何记录，巡检也无从补发。
+        这里在重连成功后异步拉一次全量卖出订单做对账，把窗口内漏的单补回库。
+        带 5 分钟冷却，避免频繁重连把请求打多触发风控。
+        """
+        try:
+            now = time.time()
+            if now - float(getattr(self, '_conn_sync_at', 0.0) or 0.0) < 300:
+                return
+            self._conn_sync_at = now
+
+            # 错峰：多账号不要在同一毫秒一起请求
+            await asyncio.sleep(random.uniform(2, 6))
+
+            from utils import risk_control
+            guard = risk_control.registry.get(self.cookie_id)
+            if guard.is_blocked:
+                logger.info(f"【{self.cookie_id}】风控冷却中，跳过{reason}后的订单同步")
+                return
+
+            from utils.seller_order_sync import sync_account_orders
+
+            result = await sync_account_orders(self.cookie_id, self.cookies_str)
+            self.last_order_sync_time = time.time()
+
+            new_cookies = result.get('cookies_str')
+            if new_cookies and new_cookies != self.cookies_str:
+                self.cookies_str = new_cookies
+
+            logger.info(
+                f"【{self.cookie_id}】{reason}后订单同步完成: 共 {result['total']} 单，"
+                f"成功 {result['saved']}，失败 {result['failed']}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】{reason}后订单同步失败: {self._safe_str(e)}")
+
 
     async def item_polish_loop(self):
         """商品擦亮定时任务。
@@ -11238,6 +11279,17 @@ class XianyuLive:
                             self._set_connection_state(ConnectionState.CONNECTED, "初始化完成，连接就绪")
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
+
+                            # [LOCAL-PATCH] N1：连上后补一次卖出订单同步，补回断连窗口漏掉的单。
+                            # Token 定时刷新会主动断开 WebSocket 换 Token，这 1～2 秒内产生的
+                            # 订单消息会永久丢失（2026-11-23 13:06 那单：本地库完全没有记录，
+                            # 巡检只查本地库，也无从补发）。首次连接交给 order_sync_loop，这里只管重连。
+                            if getattr(self, '_had_connected_once', False):
+                                self._create_tracked_task(
+                                    self._sync_orders_after_connect("WebSocket重连")
+                                )
+                            else:
+                                self._had_connected_once = True
 
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
